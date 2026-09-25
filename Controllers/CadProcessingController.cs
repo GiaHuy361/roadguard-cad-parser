@@ -13,11 +13,35 @@ using RoadGuard.CadParser.Services.Interfaces;
 namespace RoadGuard.CadParser.Controllers
 {
     /// <summary>
+    /// Form-data request model for the DXF parsing endpoint.
+    /// Encapsulates the uploaded file and parsing options for Swashbuckle compatibility.
+    /// </summary>
+    public sealed class CadParseRequest
+    {
+        /// <summary>
+        /// Multipart form-data file field named 'file'. Accepts .dxf files (max 100 MB).
+        /// </summary>
+        public IFormFile File { get; set; } = null!;
+
+        /// <summary>
+        /// Target Spatial Reference ID for all output geometries.
+        /// Supported: 4326 (WGS-84, default), 32648 (UTM 48N), 32649 (UTM 49N).
+        /// </summary>
+        public int TargetSrid { get; set; } = 4326;
+
+        /// <summary>
+        /// Number of line segments per full circle when approximating curves.
+        /// Range: 8 - 360. Default: 72.
+        /// </summary>
+        public int TessellationSegments { get; set; } = 72;
+    }
+
+    /// <summary>
     /// HTTP API surface for the RoadGuard CAD processing module.
     ///
     /// Routes:
-    ///   POST /api/cad/parse-dxf   — Upload a DXF file, receive GeoJSON.
-    ///   GET  /api/cad/health      — Liveness probe.
+    ///   POST /api/cad/parse-dxf   - Upload a DXF file, receive GeoJSON.
+    ///   GET  /api/cad/health      - Liveness probe.
     /// </summary>
     [ApiController]
     [Route("api/cad")]
@@ -54,17 +78,8 @@ namespace RoadGuard.CadParser.Controllers
         /// Each GeoJSON Feature carries the originating layer name, color, and lineweight
         /// in its Properties dictionary.
         /// </summary>
-        /// <param name="file">
-        ///   Multipart form-data file field named <c>file</c>.
-        ///   Only <c>.dxf</c> extension is accepted (max 100 MB).
-        /// </param>
-        /// <param name="srid">
-        ///   Target Spatial Reference ID for all output geometries.
-        ///   Accepted: <c>4326</c> (WGS-84, default), <c>32648</c> (UTM 48N), <c>32649</c> (UTM 49N).
-        /// </param>
-        /// <param name="tessellationSegments">
-        ///   Number of line segments per full circle when approximating curves.
-        ///   Range: 8 – 360. Default: 72.
+        /// <param name="request">
+        ///   Multipart form-data model containing the DXF file, target SRID, and tessellation options.
         /// </param>
         /// <param name="cancellationToken">Propagated from the HTTP pipeline.</param>
         /// <response code="200">Parsing succeeded; body contains <see cref="GeoJsonResponse"/>.</response>
@@ -73,6 +88,7 @@ namespace RoadGuard.CadParser.Controllers
         /// <response code="422">File is a valid DXF container but the content is corrupt or unparseable.</response>
         /// <response code="500">Unexpected server-side failure.</response>
         [HttpPost("parse-dxf")]
+        [Consumes("multipart/form-data")]
         [RequestSizeLimit(104_857_600)]   // 100 MB
         [RequestFormLimits(MultipartBodyLengthLimit = 104_857_600)]
         [ProducesResponseType(typeof(GeoJsonResponse), StatusCodes.Status200OK)]
@@ -81,13 +97,11 @@ namespace RoadGuard.CadParser.Controllers
         [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status422UnprocessableEntity)]
         [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status500InternalServerError)]
         public async Task<IActionResult> ParseDxf(
-            [FromForm] IFormFile file,
-            [FromQuery] int srid                 = 4326,
-            [FromQuery] int tessellationSegments = 72,
-            CancellationToken cancellationToken  = default)
+            [FromForm] CadParseRequest request,
+            CancellationToken cancellationToken = default)
         {
-            // ── Guard: file presence ─────────────────────────────────────── //
-            if (file is null || file.Length == 0)
+            // Guard: request & file presence
+            if (request is null || request.File is null || request.File.Length == 0)
             {
                 return BadRequest(new CadParserErrorResponse
                 {
@@ -97,7 +111,11 @@ namespace RoadGuard.CadParser.Controllers
                 });
             }
 
-            // ── Guard: SRID ──────────────────────────────────────────────── //
+            var file = request.File;
+            var srid = request.TargetSrid;
+            var tessellationSegments = request.TessellationSegments;
+
+            // Guard: SRID
             if (srid is not (4326 or 32648 or 32649))
             {
                 return BadRequest(new CadParserErrorResponse
@@ -108,7 +126,7 @@ namespace RoadGuard.CadParser.Controllers
                 });
             }
 
-            // ── Guard: tessellation range ────────────────────────────────── //
+            // Guard: tessellation range
             if (tessellationSegments is < 8 or > 360)
             {
                 return BadRequest(new CadParserErrorResponse
