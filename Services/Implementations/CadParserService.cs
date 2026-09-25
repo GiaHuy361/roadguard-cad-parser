@@ -93,15 +93,15 @@ namespace RoadGuard.CadParser.Services.Implementations
                 file.FileName, file.Length, srid, tessellationSegments);
 
             // ── 2. Buffer IFormFile entirely in-memory (no temp file writes) //
-            using var memoryStream = new MemoryStream((int)file.Length);
-            await file.CopyToAsync(memoryStream, cancellationToken).ConfigureAwait(false);
-            memoryStream.Position = 0;
+            using var stream = new MemoryStream();
+            await file.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
+            stream.Position = 0;
 
             // ── 3. Load DXF document ─────────────────────────────────────── //
             DxfDocument dxfDoc;
             try
             {
-                dxfDoc = DxfDocument.Load(memoryStream);
+                dxfDoc = DxfDocument.Load(stream);
             }
             catch (Exception ex)
             {
