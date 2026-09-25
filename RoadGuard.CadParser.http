@@ -1,0 +1,6 @@
+@RoadGuard.CadParser_HostAddress = http://localhost:5198
+
+GET {{RoadGuard.CadParser_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
