@@ -335,6 +335,67 @@ namespace RoadGuard.CadParser.Controllers
 
 
         // ================================================================== //
+        //  POST /api/cad/parse-road                                           //
+        // ================================================================== //
+
+        /// <summary>
+        /// Extracts GPS coordinates for the main road centerline and creates a 2D road corridor polygon
+        /// with width roadWidth, filtered from clutter and formatted for GIS / Leaflet mapping.
+        /// </summary>
+        /// <response code="200">Returns GPS coordinates for centerline, road surface polygon, and bounds.</response>
+        /// <response code="400">If the uploaded file is missing or invalid.</response>
+        [HttpPost("parse-road")]
+        [Consumes("multipart/form-data")]
+        [Produces("application/json")]
+        [ProducesResponseType(typeof(CadParseRoadResponse), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status400BadRequest)]
+        public async Task<IActionResult> ParseRoad(
+            [FromForm] CadParseRoadRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            if (request is null || request.File is null || request.File.Length == 0)
+            {
+                return BadRequest(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.BadRequest,
+                    Error      = "MissingFile",
+                    Detail     = "Request must include a non-empty file in the 'file' form-data field."
+                });
+            }
+
+            try
+            {
+                var result = await _parserService.ParseRoadAsync(
+                    request.File,
+                    request.RoadWidth > 0 ? request.RoadWidth : 7.0,
+                    request.CenterlineLayerName,
+                    cancellationToken).ConfigureAwait(false);
+
+                if (!result.Success)
+                {
+                    return StatusCode((int)HttpStatusCode.UnprocessableEntity, new CadParserErrorResponse
+                    {
+                        StatusCode = (int)HttpStatusCode.UnprocessableEntity,
+                        Error      = result.Error ?? "ParseRoadFailed",
+                        Detail     = result.Detail ?? "Unable to extract road geometry from CAD drawing."
+                    });
+                }
+
+                return Ok(result);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled exception during ParseRoad.");
+                return StatusCode((int)HttpStatusCode.InternalServerError, new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.InternalServerError,
+                    Error      = "InternalServerError",
+                    Detail     = ex.Message
+                });
+            }
+        }
+
+        // ================================================================== //
         //  POST /api/cad/render-overlay                                       //
         // ================================================================== //
 

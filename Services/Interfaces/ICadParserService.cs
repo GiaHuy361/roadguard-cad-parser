@@ -88,5 +88,14 @@ namespace RoadGuard.CadParser.Services.Interfaces
             double roadWidth = 7.0,
             int outputSizePx = 2048,
             CancellationToken cancellationToken = default);
+        /// <summary>
+        /// Extracts GPS coordinates for the main road centerline and creates a 2D road corridor polygon
+        /// with width roadWidth, filtered from clutter and formatted for GIS / Leaflet mapping.
+        /// </summary>
+        Task<CadParseRoadResponse> ParseRoadAsync(
+            IFormFile file,
+            double roadWidth = 7.0,
+            string? centerlineLayerName = null,
+            CancellationToken cancellationToken = default);
     }
 }

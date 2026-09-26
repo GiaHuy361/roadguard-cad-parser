@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.IO;
@@ -159,6 +159,54 @@ namespace RoadGuard.CadParser.Services.Implementations
                 if (File.Exists(tempFile))
                 {
                     try { File.Delete(tempFile); } catch { }
+                }
+            }
+        }
+
+
+        /// <inheritdoc/>
+        public async Task<CadParseRoadResponse> ParseRoadAsync(
+            IFormFile file,
+            double roadWidth = 7.0,
+            string? centerlineLayerName = null,
+            CancellationToken cancellationToken = default)
+        {
+            ValidateFile(file);
+
+            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
+            try
+            {
+                await using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
+                }
+
+                var bridgeArgs = $"parse-road \"{tempFile}\" --width {roadWidth}";
+                if (!string.IsNullOrWhiteSpace(centerlineLayerName))
+                {
+                    bridgeArgs += $" --layer \"{centerlineLayerName}\"";
+                }
+
+                var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+                var result = Newtonsoft.Json.JsonConvert.DeserializeObject<CadParseRoadResponse>(json);
+                if (result is null || !result.Success)
+                {
+                    _logger.LogWarning("Python parse-road bridge returned unsuccessful or empty response.");
+                    return result ?? new CadParseRoadResponse
+                    {
+                        Success = false,
+                        Error   = "ParseRoadFailed",
+                        Detail  = "Failed to parse road centerline and polygon from CAD drawing."
+                    };
+                }
+
+                return result;
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                {
+                    try { File.Delete(tempFile); } catch { /* best-effort cleanup */ }
                 }
             }
         }
@@ -545,6 +593,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                 Arguments = $"\"{scriptPath}\" {arguments}",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8,
                 UseShellExecute = false,
                 CreateNoWindow = true
             };

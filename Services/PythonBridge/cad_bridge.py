@@ -9,6 +9,11 @@ Commands:
 """
 
 import os, sys, math, json, argparse, base64, io
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 import ezdxf
 from ezdxf import path as dxf_path
 from ezdxf.addons.drawing.properties import Filling
@@ -605,6 +610,160 @@ def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
         "features": features
     }
 
+
+# =============================================================================
+# Parse Road Vector & 2D Concrete Surface (GPS WGS-84 Coordinates)
+# =============================================================================
+
+def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = None) -> dict:
+    """
+    Extracts the main road centerline from CAD and expands it by `road_width`
+    into a realistic 2D concrete road surface polygon.
+    Filters out technical clutter (cross sections, title blocks, distant annotations).
+    Chains continuous segments and transforms coordinates from VN-2000 to WGS-84 GPS [lat, lon].
+    """
+    doc = ezdxf.readfile(dxf_path_str)
+    msp = doc.modelspace()
+
+    chosen_layer = target_layer
+    if not chosen_layer:
+        chosen_layer, _ = _detect_centerline_layer(msp, doc)
+
+    if not chosen_layer:
+        return {
+            "success": False,
+            "error": "NoCenterlineLayer",
+            "detail": "Could not identify a centerline layer in the CAD drawing."
+        }
+
+    # Extract linear geometry for the centerline layer
+    segments = []
+    for entity, xform in walk_entities(msp, doc):
+        if entity.dxftype() in LINEAR_TYPES:
+            lyr = entity.dxf.get("layer", "")
+            if lyr.upper() == chosen_layer.upper():
+                pts = entity_to_wcs_points(entity, xform)
+                if pts and len(pts) >= 2:
+                    segments.append(pts)
+
+    if not segments:
+        return {
+            "success": False,
+            "error": "EmptyCenterline",
+            "detail": f"No linear entities found in layer {chosen_layer}."
+        }
+
+    # Chain connecting segments into the primary continuous road path
+    def seg_len(s):
+        return sum(math.hypot(s[i][0] - s[i - 1][0], s[i][1] - s[i - 1][1]) for i in range(1, len(s)))
+
+    sorted_segs = sorted(segments, key=seg_len, reverse=True)
+    chain = list(sorted_segs[0])
+    used = {0}
+    tol = 2.5
+    changed = True
+    while changed:
+        changed = False
+        for idx, s in enumerate(sorted_segs):
+            if idx in used:
+                continue
+            head, tail = chain[0], chain[-1]
+            s_start, s_end = s[0], s[-1]
+            if math.hypot(tail[0] - s_start[0], tail[1] - s_start[1]) <= tol:
+                chain.extend(s[1:])
+                used.add(idx)
+                changed = True
+                break
+            elif math.hypot(tail[0] - s_end[0], tail[1] - s_end[1]) <= tol:
+                chain.extend(list(reversed(s))[1:])
+                used.add(idx)
+                changed = True
+                break
+            elif math.hypot(head[0] - s_end[0], head[1] - s_end[1]) <= tol:
+                chain = list(s[:-1]) + chain
+                used.add(idx)
+                changed = True
+                break
+            elif math.hypot(head[0] - s_start[0], head[1] - s_start[1]) <= tol:
+                chain = list(reversed(s))[:-1] + chain
+                used.add(idx)
+                changed = True
+                break
+
+    is_vn = _is_vn2000(chain[0][0], chain[0][1])
+    if is_vn:
+        tot_len = sum(math.hypot(chain[i][0] - chain[i - 1][0], chain[i][1] - chain[i - 1][1]) for i in range(1, len(chain)))
+        half_w = max(0.5, road_width / 2.0)
+    else:
+        deg_len = sum(math.hypot(chain[i][0] - chain[i - 1][0], chain[i][1] - chain[i - 1][1]) for i in range(1, len(chain)))
+        tot_len = deg_len * 111320.0
+        half_w = (max(0.5, road_width / 2.0)) / 111320.0
+
+    # Compute ribbon and edge normals
+    n = len(chain)
+    normals = []
+    for i in range(n - 1):
+        dx = chain[i + 1][0] - chain[i][0]
+        dy = chain[i + 1][1] - chain[i][1]
+        l = math.hypot(dx, dy)
+        normals.append((-dy / l, dx / l) if l > 1e-9 else (0.0, 0.0))
+    normals.append(normals[-1])
+
+    left_pts, right_pts = [], []
+    for i in range(n):
+        if i == 0:
+            nx, ny = normals[0]
+        elif i == n - 1:
+            nx, ny = normals[-1]
+        else:
+            nx = (normals[i - 1][0] + normals[i][0]) / 2.0
+            ny = (normals[i - 1][1] + normals[i][1]) / 2.0
+            norm_len = math.hypot(nx, ny)
+            if norm_len > 1e-6:
+                nx /= norm_len
+                ny /= norm_len
+        left_pts.append((chain[i][0] + nx * half_w, chain[i][1] + ny * half_w))
+        right_pts.append((chain[i][0] - nx * half_w, chain[i][1] - ny * half_w))
+
+    polygon_pts = left_pts + list(reversed(right_pts)) + [left_pts[0]]
+
+    # Project to WGS-84 [lon, lat] via pyproj if needed
+    if is_vn:
+        cl_wgs = project_to_wgs84(chain)
+        poly_wgs = project_to_wgs84(polygon_pts)
+        left_wgs = project_to_wgs84(left_pts)
+        right_wgs = project_to_wgs84(right_pts)
+    else:
+        cl_wgs = chain
+        poly_wgs = polygon_pts
+        left_wgs = left_pts
+        right_wgs = right_pts
+
+    # Convert to GPS [lat, lon]
+    centerline = [[round(p[1], 6), round(p[0], 6)] for p in cl_wgs]
+    road_surface_poly = [[round(p[1], 6), round(p[0], 6)] for p in poly_wgs]
+    left_edge = [[round(p[1], 6), round(p[0], 6)] for p in left_wgs]
+    right_edge = [[round(p[1], 6), round(p[0], 6)] for p in right_wgs]
+
+    all_lats = [p[0] for p in road_surface_poly]
+    all_lons = [p[1] for p in road_surface_poly]
+    bounds = [
+        [round(min(all_lats), 6), round(min(all_lons), 6)],
+        [round(max(all_lats), 6), round(max(all_lons), 6)]
+    ]
+
+    return {
+        "success": True,
+        "roadName": "\u0054\u0075\u0079\u1ebf\u006e\u0020\u0111\u01b0\u1edd\u006e\u0067\u0020\u0063\u0068\u00ed\u006e\u0068",
+        "roadWidth": road_width,
+        "totalLengthMeters": round(tot_len, 2),
+        "bounds": bounds,
+        "centerline": centerline,
+        "roadSurfacePolygon": road_surface_poly,
+        "leftEdge": left_edge,
+        "rightEdge": right_edge
+    }
+
 def render_dxf_to_png(
     dxf_path_str: str,
     output_size_px: int = 4096,
@@ -816,6 +975,10 @@ def main():
     pp.add_argument("dxf_path"); pp.add_argument("--layer", default=None)
     pp.add_argument("--srid", type=int, default=4326)
 
+    rpp = sub.add_parser("parse-road")
+    rpp.add_argument("dxf_path")
+    rpp.add_argument("--width", type=float, default=7.0, help="Road width in meters")
+    rpp.add_argument("--layer", default=None, help="Force centerline layer")
     rp = sub.add_parser("render")
     rp.add_argument("dxf_path")
     rp.add_argument("--size", type=int, default=4096)
@@ -836,6 +999,12 @@ def main():
             print(json.dumps({"success": True, "layers": get_layers(args.dxf_path)}))
         elif args.command == "parse":
             print(json.dumps(extract_geometries(args.dxf_path, args.layer, args.srid)))
+        elif args.command == "parse-road":
+            print(json.dumps(parse_road(
+                args.dxf_path,
+                road_width=getattr(args, "width", 7.0),
+                target_layer=getattr(args, "layer", None)
+            ), ensure_ascii=False))
         elif args.command == "render":
             print(json.dumps(render_dxf_to_png(
                 args.dxf_path,
