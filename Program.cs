@@ -129,7 +129,7 @@ else
 }
 
 app.UseHttpsRedirection();
-app.UseCors("CadParserCorsPolicy");
+app.UseCors("AllowAll");
 app.UseRouting();
 app.UseAuthorization();
 app.MapControllers();
