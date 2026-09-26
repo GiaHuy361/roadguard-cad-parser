@@ -38,6 +38,12 @@ namespace RoadGuard.CadParser.Controllers
         /// Range: 8 - 360. Default: 72.
         /// </summary>
         public int TessellationSegments { get; set; } = 72;
+
+        public double SegmentLength { get; set; } = 100.0;
+
+        public double RoadWidth { get; set; } = 3.5;
+
+        public double SlabLength { get; set; } = 4.0;
     }
 
     /// <summary>
@@ -148,7 +154,13 @@ namespace RoadGuard.CadParser.Controllers
             try
             {
                 var result = await _parserService.ParseDxfAsync(
-                    file, srid, tessellationSegments, cancellationToken).ConfigureAwait(false);
+                    file,
+                    srid,
+                    tessellationSegments,
+                    request.SegmentLength,
+                    request.RoadWidth,
+                    request.SlabLength,
+                    cancellationToken).ConfigureAwait(false);
 
                 return Ok(result);
             }
@@ -232,6 +244,14 @@ namespace RoadGuard.CadParser.Controllers
                 Layer = new Layer("ROAD_MOCK_LAYER")
             };
             doc.AddEntity(rect);
+
+            var centerline = new Line(
+                new netDxf.Vector3(106.700, 10.805, 0),
+                new netDxf.Vector3(106.710, 10.805, 0))
+            {
+                Layer = new Layer("ROAD_CENTERLINE")
+            };
+            doc.AddEntity(centerline);
 
             var stream = new MemoryStream();
             doc.Save(stream);

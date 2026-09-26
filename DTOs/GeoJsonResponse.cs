@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using GeoJSON.Net.Feature;
 
@@ -12,20 +12,25 @@ namespace RoadGuard.CadParser.DTOs
     {
         /// <summary>
         /// Total length of all LineString / MultiLineString geometries in the drawing, in metres.
-        /// For SRID 4326 (degrees), raw degree-length is multiplied by 111,320 m/° (equatorial approximation).
+        /// For SRID 4326 (degrees), raw degree-length is multiplied by 111,320 m/deg (equatorial approximation).
         /// For SRID 32648/32649 (UTM, metres), the raw NTS length is used directly.
         /// </summary>
         public double TotalLengthMeters { get; init; }
 
         /// <summary>
+        /// Calculated total road surface area in square metres (TotalLengthMeters * RoadWidth).
+        /// </summary>
+        public double TotalAreaSqm { get; init; }
+
+        /// <summary>
         /// Estimated number of concrete road slabs.
-        /// Formula (TCVN 10380:2014): TotalLengthMeters / 4.0 m per slab.
+        /// Formula (TCVN 10380:2014): ceil(TotalLengthMeters / SlabLength).
         /// </summary>
         public int EstimatedConcreteSlabs { get; init; }
 
         /// <summary>
-        /// Number of 100-metre road segments inferred from total length.
-        /// Formula: ceil(TotalLengthMeters / 100.0).
+        /// Number of road segments inferred from total length.
+        /// Formula: ceil(TotalLengthMeters / SegmentLength).
         /// </summary>
         public int RoadSegments { get; init; }
 
@@ -73,7 +78,7 @@ namespace RoadGuard.CadParser.DTOs
         public List<string> Warnings { get; init; } = new();
 
         /// <summary>
-        /// Spatial engineering analytics: total road length, slab count (TCVN 10380:2014),
+        /// Spatial engineering analytics: total road length, surface area, slab count (TCVN 10380:2014),
         /// segment count, and total processing time.
         /// </summary>
         public EngineeringAnalytics Analytics { get; init; } = new();

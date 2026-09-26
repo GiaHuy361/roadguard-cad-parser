@@ -19,7 +19,7 @@ namespace RoadGuard.CadParser.Services.Interfaces
         /// Parses an AutoCAD DXF file received as an <see cref="IFormFile"/> and
         /// returns a <see cref="GeoJsonResponse"/> containing a GeoJSON FeatureCollection
         /// with every graphic entity mapped to a Feature, layer metadata embedded in
-        /// each Feature''s Properties, and all NTS Geometry objects stamped with the
+        /// each Feature's Properties, and all NTS Geometry objects stamped with the
         /// requested SRID.
         /// </summary>
         /// <param name="file">
@@ -34,21 +34,32 @@ namespace RoadGuard.CadParser.Services.Interfaces
         /// <param name="tessellationSegments">
         ///   Number of line segments used to approximate a full circle when tessellating
         ///   curves (bulge arcs, Arc entities, Circle entities).
-        ///   Defaults to 72 (5° per segment). Minimum value is 8.
+        ///   Defaults to 72 (5 deg per segment). Minimum value is 8.
+        /// </param>
+        /// <param name="segmentLength">
+        ///   Segment length in metres for road segmentation.
+        ///   Defaults to 100.0 m.
+        /// </param>
+        /// <param name="roadWidth">
+        ///   Road width in metres for surface area calculation and polygon buffering.
+        ///   Defaults to 3.5 m.
+        /// </param>
+        /// <param name="slabLength">
+        ///   Length in metres per concrete slab (TCVN 10380:2014).
+        ///   Defaults to 4.0 m.
         /// </param>
         /// <param name="cancellationToken">Propagates cancellation from the HTTP pipeline.</param>
         /// <returns>
         ///   A populated <see cref="GeoJsonResponse"/> on success.
         ///   Non-fatal issues are reported via <see cref="GeoJsonResponse.Warnings"/>.
         /// </returns>
-        /// <exception cref="ArgumentNullException">Thrown when <paramref name="file"/> is null.</exception>
-        /// <exception cref="InvalidOperationException">
-        ///   Thrown for fatal parsing failures (corrupted file, unsupported DXF version, etc.).
-        /// </exception>
         Task<GeoJsonResponse> ParseDxfAsync(
             IFormFile file,
             int srid = 4326,
             int tessellationSegments = 72,
+            double segmentLength = 100.0,
+            double roadWidth = 3.5,
+            double slabLength = 4.0,
             CancellationToken cancellationToken = default);
     }
 }

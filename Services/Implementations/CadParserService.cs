@@ -19,6 +19,8 @@ using RoadGuard.CadParser.Entities;
 using NtsGeometry = NetTopologySuite.Geometries;
 using NtsGeometryFactory = NetTopologySuite.Geometries.GeometryFactory;
 using NtsPrecisionModel = NetTopologySuite.Geometries.PrecisionModel;
+using NtsPolygon = NetTopologySuite.Geometries.Polygon;
+using NtsMultiPolygon = NetTopologySuite.Geometries.MultiPolygon;
 using RoadGuard.CadParser.Helpers;
 using RoadGuard.CadParser.Services.Interfaces;
 
@@ -64,6 +66,7 @@ namespace RoadGuard.CadParser.Services.Implementations
         private const long   MaxFileSizeBytes    = 100 * 1024 * 1024; // 100 MB
         private const string SupportedExtension  = ".dxf";
         private const int    MinTessellationSegs = 8;
+        private const double MetersPerDegree     = 111320.0;
 
         // ------------------------------------------------------------------ //
         //  Dependencies                                                        //
@@ -89,12 +92,18 @@ namespace RoadGuard.CadParser.Services.Implementations
             IFormFile file,
             int srid                 = 4326,
             int tessellationSegments = 72,
+            double segmentLength     = 100.0,
+            double roadWidth         = 3.5,
+            double slabLength        = 4.0,
             CancellationToken cancellationToken = default)
         {
             // ── 1. Validate inputs ───────────────────────────────────────── //
             ValidateFile(file);
             ValidateSrid(srid);
             tessellationSegments = Math.Max(MinTessellationSegs, tessellationSegments);
+            if (segmentLength <= 0) segmentLength = 100.0;
+            if (roadWidth <= 0)     roadWidth     = 3.5;
+            if (slabLength <= 0)    slabLength    = 4.0;
 
             var stopwatch = Stopwatch.StartNew();
 
@@ -133,16 +142,21 @@ namespace RoadGuard.CadParser.Services.Implementations
             ProcessAllEntities(dxfDoc, features, warnings, featuresByLayer,
                                tessellationSegments, srid);
 
+            GenerateRoadSurfaceBuffers(features, featuresByLayer, roadWidth, srid);
+
             _logger.LogInformation(
                 "Parse complete: {Count} features, {Layers} layer(s), {Warns} warning(s).",
                 features.Count, featuresByLayer.Count, warnings.Count);
 
-            // -- Analytics (TCVN 10380:2014) --
+            // -- Analytics (TCVN 10380:2014) & Dynamic Spatial Math --
             stopwatch.Stop();
             const double MetersPerDegree = 111320.0;
             double rawLen = 0.0;
             foreach (var feat in features)
             {
+                if (feat.Properties.TryGetValue("isGeneratedBuffer", out var isGen) && isGen is true)
+                    continue;
+
                 switch (feat.Geometry)
                 {
                     case GjsLineStr ls:
@@ -168,7 +182,13 @@ namespace RoadGuard.CadParser.Services.Implementations
                         break;
                 }
             }
-            double totalMeters = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
+            double totalMeters  = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
+            double totalAreaSqm = Math.Round(totalMeters * roadWidth, 2);
+            int estimatedSlabs  = (int)Math.Ceiling(totalMeters / slabLength);
+            int roadSegments    = (int)Math.Ceiling(totalMeters / segmentLength);
+
+            // Step 5: Database Persistence
+            await PersistToDatabaseAsync(file.FileName, srid, features, cancellationToken).ConfigureAwait(false);
 
             return new GeoJsonResponse
             {
@@ -181,8 +201,9 @@ namespace RoadGuard.CadParser.Services.Implementations
                 Analytics           = new EngineeringAnalytics
                 {
                     TotalLengthMeters      = Math.Round(totalMeters, 3),
-                    EstimatedConcreteSlabs = (int)(totalMeters / 4.0),
-                    RoadSegments           = (int)Math.Ceiling(totalMeters / 100.0),
+                    TotalAreaSqm           = totalAreaSqm,
+                    EstimatedConcreteSlabs = estimatedSlabs,
+                    RoadSegments           = roadSegments,
                     ProcessingTimeMs       = stopwatch.ElapsedMilliseconds
                 }
             };
@@ -531,6 +552,8 @@ namespace RoadGuard.CadParser.Services.Implementations
 
             return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
             {
+                // UI layer classification
+                ["layerType"]       = DetermineLayerType(entity),
                 // Layer metadata — populated dynamically from whatever layers exist in the DXF
                 ["layerName"]       = layer.Name,
                 ["layerColor"]      = colorHex,
@@ -611,5 +634,156 @@ namespace RoadGuard.CadParser.Services.Implementations
             15 => "#7F5F5F",
             _  => $"#{(aci * 13 % 256):X2}{(aci * 37 % 256):X2}{(aci * 71 % 256):X2}"
         };
+
+        // ================================================================== //
+        //  Private - Layer Classification & Surface Buffer Generator         //
+        // ================================================================== //
+
+        private static string DetermineLayerType(EntityObject entity)
+        {
+            var layerName = entity.Layer?.Name?.ToUpperInvariant() ?? string.Empty;
+            if (layerName.Contains("EDGE") || layerName.Contains("BIEN") || layerName.Contains("LE"))
+                return "Edges";
+            if (layerName.Contains("BOUND") || layerName.Contains("RANH") || layerName.Contains("GIOI"))
+                return "Boundaries";
+            if (layerName.Contains("SURFACE") || layerName.Contains("MAT"))
+                return "RoadSurface";
+            return "Centerline";
+        }
+
+        private void GenerateRoadSurfaceBuffers(
+            List<Feature> features,
+            Dictionary<string, int> featuresByLayer,
+            double roadWidth,
+            int srid)
+        {
+            double bufferDistance = (srid == 4326) ? (roadWidth / 2.0) / MetersPerDegree : (roadWidth / 2.0);
+            var bufferFeatures = new List<Feature>();
+            var ntsFactory = new NtsGeometryFactory(new NtsPrecisionModel(), srid);
+
+            foreach (var feat in features)
+            {
+                if (feat.Properties.TryGetValue("layerType", out var lt) &&
+                    lt is string typeStr &&
+                    string.Equals(typeStr, "Centerline", StringComparison.OrdinalIgnoreCase) &&
+                    feat.Geometry is GjsLineStr lineStr &&
+                    lineStr.Coordinates.Count >= 2)
+                {
+                    try
+                    {
+                        var ntsCoords = lineStr.Coordinates
+                            .Select(c => new NtsCoordinate(c.Longitude, c.Latitude))
+                            .ToArray();
+                        var ntsLine = ntsFactory.CreateLineString(ntsCoords);
+                        var bufferedGeom = ntsLine.Buffer(bufferDistance);
+
+                        if (bufferedGeom is NtsPolygon ntsPoly && !ntsPoly.IsEmpty)
+                        {
+                            var shellCoords = ntsPoly.ExteriorRing.Coordinates
+                                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X))
+                                .ToList();
+                            var gjsRing = new GjsLineStr(shellCoords);
+                            var gjsPoly = new GjsPolygon(new List<GjsLineStr> { gjsRing });
+
+                            var bufferProps = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                            {
+                                ["layerName"]        = "ROAD_SURFACE",
+                                ["layerType"]        = "RoadSurface",
+                                ["layerColor"]       = "#3B82F6",
+                                ["layerLineweight"]  = "default",
+                                ["layerLinetype"]    = "CONTINUOUS",
+                                ["layerIsVisible"]   = true,
+                                ["layerIsFrozen"]    = false,
+                                ["entityType"]       = "Polygon",
+                                ["entityHandle"]     = "GEN_SURFACE",
+                                ["isGeneratedBuffer"] = true
+                            };
+
+                            bufferFeatures.Add(new Feature(gjsPoly, bufferProps));
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogDebug(ex, "Failed to create road surface buffer for centerline feature.");
+                    }
+                }
+            }
+
+            if (bufferFeatures.Count > 0)
+            {
+                features.AddRange(bufferFeatures);
+                featuresByLayer["ROAD_SURFACE"] = featuresByLayer.TryGetValue("ROAD_SURFACE", out var cur)
+                    ? cur + bufferFeatures.Count
+                    : bufferFeatures.Count;
+            }
+        }
+
+        private async Task PersistToDatabaseAsync(
+            string fileName,
+            int srid,
+            List<Feature> features,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                var ntsFactory = new NtsGeometryFactory(new NtsPrecisionModel(), srid);
+                var drawing = new CadDrawing
+                {
+                    Id          = Guid.NewGuid(),
+                    FileName    = fileName,
+                    ParsedAtUtc = DateTime.UtcNow,
+                    Srid        = srid
+                };
+
+                foreach (var feat in features)
+                {
+                    NtsGeometry.Geometry? geom = null;
+                    switch (feat.Geometry)
+                    {
+                        case GjsLineStr ls when ls.Coordinates.Count >= 2:
+                            var lineCoords = ls.Coordinates
+                                .Select(c => new NtsCoordinate(c.Longitude, c.Latitude))
+                                .ToArray();
+                            geom = ntsFactory.CreateLineString(lineCoords);
+                            break;
+
+                        case GjsPolygon poly when poly.Coordinates.Count > 0 && poly.Coordinates[0].Coordinates.Count >= 4:
+                            var shellCoords = poly.Coordinates[0].Coordinates
+                                .Select(c => new NtsCoordinate(c.Longitude, c.Latitude))
+                                .ToArray();
+                            geom = ntsFactory.CreatePolygon(shellCoords);
+                            break;
+
+                        case GjsPoint pt:
+                            geom = ntsFactory.CreatePoint(new NtsCoordinate(pt.Coordinates.Longitude, pt.Coordinates.Latitude));
+                            break;
+                    }
+
+                    if (geom is not null)
+                    {
+                        geom.SRID = srid;
+                        string layerName = feat.Properties.TryGetValue("layerName", out var ln) && ln is string sLn ? sLn : "0";
+                        string? layerColor = feat.Properties.TryGetValue("layerColor", out var lc) && lc is string sLc ? sLc : null;
+
+                        drawing.GeometryFeatures.Add(new CadGeometryFeature
+                        {
+                            Id           = Guid.NewGuid(),
+                            CadDrawingId = drawing.Id,
+                            LayerName    = layerName,
+                            LayerColor   = layerColor,
+                            Geometry     = geom
+                        });
+                    }
+                }
+
+                _db.CadDrawings.Add(drawing);
+                await _db.SaveChangesAsync(cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("Persisted CadDrawing '{DrawingId}' with {Count} spatial features to SQL Server.", drawing.Id, drawing.GeometryFeatures.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Database persistence encountered an error. Proceeding without failing the parse request.");
+            }
+        }
     }
 }
