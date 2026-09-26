@@ -12,7 +12,12 @@ using NetTopologySuite.Geometries;
 using netDxf;
 using netDxf.Entities;
 using netDxf.Tables;
+using RoadGuard.CadParser.Data;
 using RoadGuard.CadParser.DTOs;
+using RoadGuard.CadParser.Entities;
+using NtsGeometry = NetTopologySuite.Geometries;
+using NtsGeometryFactory = NetTopologySuite.Geometries.GeometryFactory;
+using NtsPrecisionModel = NetTopologySuite.Geometries.PrecisionModel;
 using RoadGuard.CadParser.Helpers;
 using RoadGuard.CadParser.Services.Interfaces;
 
@@ -63,13 +68,15 @@ namespace RoadGuard.CadParser.Services.Implementations
         //  Dependencies                                                        //
         // ------------------------------------------------------------------ //
         private readonly ILogger<CadParserService> _logger;
+        private readonly RoadGuardDbContext         _db;
 
         // ------------------------------------------------------------------ //
         //  Constructor                                                         //
         // ------------------------------------------------------------------ //
-        public CadParserService(ILogger<CadParserService> logger)
+        public CadParserService(ILogger<CadParserService> logger, RoadGuardDbContext db)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _db     = db     ?? throw new ArgumentNullException(nameof(db));
         }
 
         // ================================================================== //

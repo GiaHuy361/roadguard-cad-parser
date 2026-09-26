@@ -5,6 +5,8 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json.Serialization;
+using Microsoft.EntityFrameworkCore;
+using RoadGuard.CadParser.Data;
 using RoadGuard.CadParser.Services.Implementations;
 using RoadGuard.CadParser.Services.Interfaces;
 
@@ -31,6 +33,14 @@ builder.Logging.AddDebug();
 // ── CAD Parser services (core DI registrations) ──────────────────────────── //
 // Scoped: CadParserService is stateless per-request; safe for concurrent use.
 builder.Services.AddScoped<ICadParserService, CadParserService>();
+
+// EF Core + SQL Server with NetTopologySuite spatial extension //
+builder.Services.AddDbContext<RoadGuardDbContext>(options =>
+    options.UseSqlServer(
+        builder.Configuration.GetConnectionString("Default"),
+        sqlOptions => sqlOptions.UseNetTopologySuite()
+    )
+);
 
 // ── ASP.NET Core MVC + Newtonsoft.Json ──────────────────────────────────── //
 // Newtonsoft.Json is required because GeoJSON.Net uses interface-typed geometry

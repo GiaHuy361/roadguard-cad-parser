@@ -2,6 +2,10 @@
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
+using System.IO;
+using netDxf;
+using netDxf.Entities;
+using netDxf.Tables;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -196,6 +200,44 @@ namespace RoadGuard.CadParser.Controllers
                         Detail     = "An unexpected error occurred. Please contact the system administrator."
                     });
             }
+        }
+
+
+        // ================================================================== //
+        //  GET /api/cad/download-mock-dxf                                     //
+        // ================================================================== //
+
+        /// <summary>
+        /// Generates and downloads a guaranteed-valid DXF mock file containing a
+        /// rectangle around coordinates (106.700, 10.800) representing a location in Vietnam.
+        /// </summary>
+        /// <response code="200">Returns the generated DXF file as an attachment.</response>
+        [HttpGet("download-mock-dxf")]
+        [Produces("application/octet-stream")]
+        [ProducesResponseType(typeof(FileResult), StatusCodes.Status200OK)]
+        public IActionResult DownloadMockDxf()
+        {
+            var doc = new DxfDocument();
+
+            // Simple rectangle around GPS location in Vietnam (106.700, 10.800)
+            var vertices = new[]
+            {
+                new LwPolylineVertex(106.700, 10.800),
+                new LwPolylineVertex(106.710, 10.800),
+                new LwPolylineVertex(106.710, 10.810),
+                new LwPolylineVertex(106.700, 10.810)
+            };
+            var rect = new LwPolyline(vertices, isClosed: true)
+            {
+                Layer = new Layer("ROAD_MOCK_LAYER")
+            };
+            doc.AddEntity(rect);
+
+            var stream = new MemoryStream();
+            doc.Save(stream);
+            stream.Position = 0;
+
+            return File(stream, "application/octet-stream", "mock_valid.dxf");
         }
 
         // ================================================================== //
