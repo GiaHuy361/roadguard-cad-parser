@@ -77,5 +77,16 @@ namespace RoadGuard.CadParser.Services.Interfaces
             double slabLength = 4.0,
             string? centerlineLayerName = null,
             CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Renders an uploaded CAD DXF drawing into a transparent 2D PNG raster overlay
+        /// styled like a realistic concrete road, returning WGS-84 Leaflet bounds and base64 PNG.
+        /// </summary>
+        Task<CadRenderOverlayResponse> RenderOverlayAsync(
+            IFormFile file,
+            string? centerlineLayerName = null,
+            double roadWidth = 7.0,
+            int outputSizePx = 2048,
+            CancellationToken cancellationToken = default);
     }
 }

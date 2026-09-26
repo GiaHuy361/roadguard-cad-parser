@@ -164,6 +164,48 @@ namespace RoadGuard.CadParser.Services.Implementations
         }
 
         /// <inheritdoc/>
+        public async Task<CadRenderOverlayResponse> RenderOverlayAsync(
+            IFormFile file,
+            string? centerlineLayerName = null,
+            double roadWidth = 7.0,
+            int outputSizePx = 2048,
+            CancellationToken cancellationToken = default)
+        {
+            ValidateFile(file);
+
+            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
+            try
+            {
+                await using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
+                }
+
+                var bridgeArgs = $"render \"{tempFile}\" --size {outputSizePx} --width {roadWidth}";
+                if (!string.IsNullOrWhiteSpace(centerlineLayerName))
+                {
+                    bridgeArgs += $" --layer \"{centerlineLayerName}\"";
+                }
+
+                var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+                var result = Newtonsoft.Json.JsonConvert.DeserializeObject<CadRenderOverlayResponse>(json);
+                if (result is null || !result.Success)
+                {
+                    throw new InvalidOperationException(result?.Detail ?? result?.Error ?? "Raster render failed in Python bridge.");
+                }
+
+                return result;
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                {
+                    try { File.Delete(tempFile); } catch { }
+                }
+            }
+        }
+
+        /// <inheritdoc/>
         public async Task<GeoJsonResponse> ParseDxfAsync(
             IFormFile file,
             int srid                 = 4326,

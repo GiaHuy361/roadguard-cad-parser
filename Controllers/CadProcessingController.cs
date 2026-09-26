@@ -335,6 +335,65 @@ namespace RoadGuard.CadParser.Controllers
 
 
         // ================================================================== //
+        //  POST /api/cad/render-overlay                                       //
+        // ================================================================== //
+
+        /// <summary>
+        /// Renders an uploaded CAD DXF drawing into a transparent 2D PNG raster overlay
+        /// styled like a realistic concrete road (grey road ribbon, yellow centerline, white edges),
+        /// returning WGS-84 Leaflet bounds and base64 PNG data.
+        /// </summary>
+        /// <response code="200">Returns WGS-84 Leaflet bounds and base64 PNG data.</response>
+        /// <response code="400">If the uploaded file is missing or invalid.</response>
+        [HttpPost("render-overlay")]
+        [Consumes("multipart/form-data")]
+        [Produces("application/json")]
+        [ProducesResponseType(typeof(CadRenderOverlayResponse), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status400BadRequest)]
+        public async Task<IActionResult> RenderOverlay(
+            [FromForm] CadRenderOverlayRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            if (request is null || request.File is null || request.File.Length == 0)
+            {
+                return BadRequest(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.BadRequest,
+                    Error      = "MissingFile",
+                    Detail     = "Request must include a non-empty file in the 'file' form-data field."
+                });
+            }
+
+            _logger.LogInformation(
+                "RenderOverlay request received: file={Name}, size={Size}B, layer={Layer}, width={Width}m",
+                request.File.FileName, request.File.Length, request.CenterlineLayerName ?? "(auto-detect)", request.RoadWidth);
+
+            try
+            {
+                var result = await _parserService.RenderOverlayAsync(
+                    request.File,
+                    request.CenterlineLayerName,
+                    request.RoadWidth,
+                    request.OutputSizePx,
+                    cancellationToken).ConfigureAwait(false);
+
+                return Ok(result);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error during DXF render overlay.");
+                return StatusCode(StatusCodes.Status500InternalServerError,
+                    new CadParserErrorResponse
+                    {
+                        StatusCode = (int)HttpStatusCode.InternalServerError,
+                        Error      = "InternalServerError",
+                        Detail     = ex.Message
+                    });
+            }
+        }
+
+
+        // ================================================================== //
         //  GET /api/cad/download-mock-dxf                                     //
         // ================================================================== //
 

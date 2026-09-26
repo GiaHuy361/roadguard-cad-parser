@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-RoadGuard CAD Parser - Python ezdxf Bridge v2.2
+RoadGuard CAD Parser - Python ezdxf Bridge v2.3
 ================================================
 Commands:
   get-layers <dxf>                              List all DXF layers
   parse      <dxf> [--layer L] [--srid N]      Extract centerline RFC 7946 GeoJSON
-  render     <dxf> [--size N] [--color #HEX]   Render transparent PNG + Leaflet bounds
+  render     <dxf> [--size N] [--width W]      Render transparent concrete road PNG + WGS-84 bounds
 """
 
 import os, sys, math, json, argparse, base64, io
 import ezdxf
 from ezdxf import path as dxf_path
+from ezdxf.addons.drawing.properties import Filling
 
 try:
     from pyproj import CRS, Transformer
@@ -288,7 +289,7 @@ def walk_entities(entities, doc, transform=None, depth=0):
                     yield from walk_entities(list(doc.blocks[bn]), doc, combined, depth + 1)
             except Exception:
                 continue
-        elif et in LINEAR_TYPES:
+        elif et in LINEAR_TYPES or et == "HATCH":
             yield (entity, transform)
 
 # =============================================================================
@@ -311,6 +312,8 @@ def get_layers(dxf_path_str):
 def _detect_centerline_layer(msp, doc):
     layer_raw = {}
     for entity, xform in walk_entities(msp, doc):
+        if entity.dxftype() not in LINEAR_TYPES:
+            continue
         lyr = entity.dxf.get("layer", "0")
         pts = entity_to_wcs_points(entity, xform)
         if pts and len(pts) >= 2:
@@ -344,6 +347,8 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326):
     chosen_layer = None
     layer_raw = {}
     for entity, xform in walk_entities(msp, doc):
+        if entity.dxftype() not in LINEAR_TYPES:
+            continue
         lyr = entity.dxf.get("layer", "0")
         all_layers.add(lyr)
         pts = entity_to_wcs_points(entity, xform)
@@ -408,7 +413,6 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326):
                 "type": "LineString",
                 "coordinates": projected
             },
-            # Compatibility properties for direct consumption
             "layer": chosen_layer,
             "segment": seg_name,
             "elevation": item["elevation"],
@@ -427,13 +431,55 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326):
     }
 
 # =============================================================================
-# Render: DXF plan-view -> transparent PNG + WGS-84 bounds
+# Road Surface Ribbon Generator
+# =============================================================================
+
+def generate_road_ribbon(points: list, road_width: float) -> list:
+    """
+    Computes a buffered 2D polygon strip (ribbon) along an ordered chain of points.
+    """
+    if len(points) < 2 or road_width <= 0:
+        return []
+    half_w = road_width / 2.0
+    left_side = []
+    right_side = []
+    n = len(points)
+    normals = []
+    for i in range(n - 1):
+        dx = points[i + 1][0] - points[i][0]
+        dy = points[i + 1][1] - points[i][1]
+        l = math.hypot(dx, dy)
+        if l < 1e-9:
+            normals.append((0.0, 0.0))
+        else:
+            normals.append((-dy / l, dx / l))
+    normals.append(normals[-1])
+
+    for i in range(n):
+        if i == 0:
+            nx, ny = normals[0]
+        elif i == n - 1:
+            nx, ny = normals[-1]
+        else:
+            nx = (normals[i - 1][0] + normals[i][0]) / 2.0
+            ny = (normals[i - 1][1] + normals[i][1]) / 2.0
+            norm_len = math.hypot(nx, ny)
+            if norm_len > 1e-6:
+                nx /= norm_len
+                ny /= norm_len
+        left_side.append((points[i][0] + nx * half_w, points[i][1] + ny * half_w))
+        right_side.append((points[i][0] - nx * half_w, points[i][1] - ny * half_w))
+
+    return left_side + right_side[::-1]
+
+# =============================================================================
+# Render: DXF plan-view -> Transparent Concrete Road PNG + WGS-84 bounds
 # =============================================================================
 
 def compute_layer_bbox(doc, layer_name):
     pts = []
     for entity, xform in walk_entities(doc.modelspace(), doc):
-        if entity.dxf.get("layer", "0").upper() == layer_name.upper():
+        if entity.dxftype() in LINEAR_TYPES and entity.dxf.get("layer", "0").upper() == layer_name.upper():
             wcs_pts = entity_to_wcs_points(entity, xform)
             pts.extend(wcs_pts)
     valid_pts = [(x, y) for x, y in pts if _is_vn2000(x, y)]
@@ -449,13 +495,15 @@ def compute_layer_bbox(doc, layer_name):
 def compute_wcs_bbox(doc):
     pts = []
     for entity, xform in walk_entities(doc.modelspace(), doc):
-        wcs_pts = entity_to_wcs_points(entity, xform)
-        for x, y in wcs_pts:
-            if _is_vn2000(x, y):
-                pts.append((x, y))
+        if entity.dxftype() in LINEAR_TYPES:
+            wcs_pts = entity_to_wcs_points(entity, xform)
+            for x, y in wcs_pts:
+                if _is_vn2000(x, y):
+                    pts.append((x, y))
     if not pts:
         for entity, xform in walk_entities(doc.modelspace(), doc):
-            pts.extend(entity_to_wcs_points(entity, xform))
+            if entity.dxftype() in LINEAR_TYPES:
+                pts.extend(entity_to_wcs_points(entity, xform))
     if not pts:
         return 0.0, 0.0, 1000.0, 1000.0
     xs = [p[0] for p in pts]
@@ -479,22 +527,81 @@ def render_dxf_to_png(
     output_size_px: int = 4096,
     background_color: str = "#00000000",
     line_color_override: str = None,
-    target_layer: str = None
+    target_layer: str = None,
+    road_width: float = 7.0
 ) -> dict:
+    """
+    Renders DXF drawing to a transparent PNG with a realistic 'Concrete Road' theme:
+    - Concrete gray road surface ribbon & hatches (80% opacity)
+    - Highway yellow thick centerline (tim tuyen)
+    - Crisp solid white road edge lines & markings (mep duong, bo via, vach son)
+    - Clutter hidden (dimensions, text, title blocks)
+    - Bounds transformed to WGS-84 Leaflet coordinates
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
     from ezdxf.addons.drawing import RenderContext, Frontend
     from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
     from ezdxf.addons.drawing.config import Configuration, BackgroundPolicy, ColorPolicy
 
     doc = ezdxf.readfile(dxf_path_str)
     msp = doc.modelspace()
+    ctx = RenderContext(doc)
 
     chosen_layer = target_layer
     if not chosen_layer:
         chosen_layer, _ = _detect_centerline_layer(msp, doc)
 
+    # ?? Style Overrides for Realistic Road Visualization ?????????????
+    original_resolve_all = ctx.resolve_all
+
+    def concrete_road_resolve_all(entity):
+        p = original_resolve_all(entity)
+        lyr = (p.layer or "").upper()
+
+        # 1. Hide technical clutter (dimensions, text, title block, cross-sections)
+        if any(k in lyr for k in ["TEXT", "DIM", "KICHTHUOC", "KHUNG", "TEN", "BANG", "GHI_CHU", "NOTE", "LUOI", "CATNGANG", "TRACDOC", "BOU"]):
+            p.is_visible = False
+            return p
+
+        # 2. Tim tuyen / Centerline -> Bold Highway Yellow
+        if any(k in lyr for k in ["ENTPLINETUYEN", "TIMTUYEN", "TIM_TUYEN", "TIMDUONG", "CENTERLINE", "TIM"]):
+            p.color = "#FFD700FF"
+            p.lineweight = 1.4
+            return p
+
+        # 3. Road Markings (Vach son) -> Solid White
+        if "VACH" in lyr:
+            p.color = "#FFFFFFEE"
+            p.lineweight = 0.9
+            return p
+
+        # 4. Mep duong / Bo via / Ranh / Le -> Crisp White
+        if any(k in lyr for k in ["MEP", "BO_VIA", "BOVIA", "VAI", "RANH", "LE"]):
+            p.color = "#F8FAFCFF"
+            p.lineweight = 0.8
+            return p
+
+        # 5. Mat duong / Hatch -> Concrete Gray with 80% opacity (#808080CC)
+        if any(k in lyr for k in ["MAT", "SURFACE", "HATCH", "BETONG", "BE_TONG", "ASPHALT", "VIA", "DUONG"]):
+            p.color = "#808080CC"
+            p.lineweight = 0.5
+            if isinstance(p.filling, Filling) or entity.dxftype() == "HATCH":
+                filling = Filling()
+                filling.type = Filling.SOLID
+                p.filling = filling
+            return p
+
+        # 6. Other auxiliary entities -> subtle faint lines
+        p.color = "#94A3B833"
+        p.lineweight = 0.2
+        return p
+
+    ctx.resolve_all = concrete_road_resolve_all
+
+    # ?? Compute Bounding Box from Centerline Layer ?????????????????????
     bbox_source = "centerline_layer"
     if chosen_layer:
         layer_bbox = compute_layer_bbox(doc, chosen_layer)
@@ -538,14 +645,25 @@ def render_dxf_to_png(
     fig.patch.set_alpha(0.0)
     ax.patch.set_alpha(0.0)
 
-    color_policy = ColorPolicy.CUSTOM if line_color_override else ColorPolicy.COLOR
+    # ?? Paint Concrete Road Ribbon Surface Under Centerline ???????????
+    if road_width > 0 and chosen_layer:
+        for entity, xform in walk_entities(msp, doc):
+            if entity.dxftype() in LINEAR_TYPES:
+                lyr = entity.dxf.get("layer", "").upper()
+                if lyr == chosen_layer.upper() or any(k in lyr for k in ["ENTPLINETUYEN", "TIMTUYEN", "TIM_TUYEN"]):
+                    pts = entity_to_wcs_points(entity, xform)
+                    if len(pts) >= 2:
+                        ribbon = generate_road_ribbon(pts, road_width)
+                        if ribbon:
+                            poly = patches.Polygon(ribbon, closed=True, facecolor="#808080", alpha=0.8, edgecolor="none", zorder=1)
+                            ax.add_patch(poly)
+
+    # ?? Render CAD Layout on Top ??????????????????????????????????????
     cfg = Configuration(
         background_policy=BackgroundPolicy.OFF,
-        color_policy=color_policy,
-        custom_fg_color=line_color_override or "#FFFFFF",
+        color_policy=ColorPolicy.COLOR,
+        lineweight_scaling=1.5
     )
-
-    ctx = RenderContext(doc)
     out = MatplotlibBackend(ax)
     frontend = Frontend(ctx, out, config=cfg)
     frontend.draw_layout(msp, finalize=True)
@@ -570,21 +688,28 @@ def render_dxf_to_png(
 
     wgs84 = bbox_to_wgs84_leaflet(crop_min_x, crop_min_y, crop_max_x, crop_max_y)
 
+    size_px = [
+        int(round(fig_w_in * dpi)),
+        int(round(fig_h_in * dpi))
+    ]
     return {
         "success": True,
+        "style": "concrete_road",
         "bbox_source": bbox_source,
         "cropped_to_layer": chosen_layer,
+        "croppedToLayer": chosen_layer,
         "bounds": [
             [wgs84["south"], wgs84["west"]],
             [wgs84["north"], wgs84["east"]]
         ],
         "bbox_wgs84": wgs84,
+        "bboxWgs84": wgs84,
         "bbox_wcs": [crop_min_x, crop_min_y, crop_max_x, crop_max_y],
+        "bboxWcs": [crop_min_x, crop_min_y, crop_max_x, crop_max_y],
         "image_base64": b64,
-        "image_size_px": [
-            int(round(fig_w_in * dpi)),
-            int(round(fig_h_in * dpi))
-        ]
+        "imageBase64": b64,
+        "image_size_px": size_px,
+        "imageSizePx": size_px
     }
 
 # =============================================================================
@@ -592,7 +717,7 @@ def render_dxf_to_png(
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="RoadGuard CAD ezdxf Bridge v2.2")
+    parser = argparse.ArgumentParser(description="RoadGuard CAD ezdxf Bridge v2.3")
     sub = parser.add_subparsers(dest="command")
 
     lp = sub.add_parser("get-layers"); lp.add_argument("dxf_path")
@@ -604,6 +729,7 @@ def main():
     rp = sub.add_parser("render")
     rp.add_argument("dxf_path")
     rp.add_argument("--size", type=int, default=4096)
+    rp.add_argument("--width", type=float, default=7.0, help="Road surface width in meters")
     rp.add_argument("--layer", default=None, help="Force centerline layer for bbox")
     rp.add_argument("--color", default=None, help="Force line color e.g. #00FFFF")
 
@@ -622,9 +748,11 @@ def main():
             print(json.dumps(extract_geometries(args.dxf_path, args.layer, args.srid)))
         elif args.command == "render":
             print(json.dumps(render_dxf_to_png(
-                args.dxf_path, output_size_px=args.size,
+                args.dxf_path,
+                output_size_px=args.size,
                 line_color_override=args.color,
-                target_layer=getattr(args, "layer", None)
+                target_layer=getattr(args, "layer", None),
+                road_width=getattr(args, "width", 7.0)
             )))
         else:
             parser.print_help(); sys.exit(1)
