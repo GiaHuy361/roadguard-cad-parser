@@ -615,7 +615,7 @@ def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
 # Parse Road Vector & 2D Concrete Surface (GPS WGS-84 Coordinates)
 # =============================================================================
 
-def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = None) -> dict:
+def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = None, central_meridian: float = None) -> dict:
     """
     Extracts the main road centerline from CAD and expands it by `road_width`
     into a realistic 2D concrete road surface polygon.
@@ -654,13 +654,33 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         }
 
     # Chain connecting segments into the primary continuous road path
+    # Filter out sharp angle turns (hairpins/cross spurs) using tangent dot product
     def seg_len(s):
         return sum(math.hypot(s[i][0] - s[i - 1][0], s[i][1] - s[i - 1][1]) for i in range(1, len(s)))
 
-    sorted_segs = sorted(segments, key=seg_len, reverse=True)
+    def get_tangent(pts, at_start=True):
+        if at_start:
+            dx = pts[1][0] - pts[0][0]
+            dy = pts[1][1] - pts[0][1]
+        else:
+            dx = pts[-1][0] - pts[-2][0]
+            dy = pts[-1][1] - pts[-2][1]
+        l = math.hypot(dx, dy)
+        return (dx / l, dy / l) if l > 1e-9 else (1.0, 0.0)
+
+    # Check for Northing/Easting axis inversion (trung truc X/Y)
+    # Standard VN-2000 in Southern VN: Easting X ~ 500,000; Northing Y ~ 1,200,000
+    cleaned_segments = []
+    for s in segments:
+        if s[0][0] > 1_000_000.0 and s[0][1] < 900_000.0:
+            cleaned_segments.append([(p[1], p[0]) for p in s])
+        else:
+            cleaned_segments.append(s)
+
+    sorted_segs = sorted(cleaned_segments, key=seg_len, reverse=True)
     chain = list(sorted_segs[0])
     used = {0}
-    tol = 2.5
+    tol = 2.0
     changed = True
     while changed:
         changed = False
@@ -669,26 +689,47 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                 continue
             head, tail = chain[0], chain[-1]
             s_start, s_end = s[0], s[-1]
+
+            # Tail connection
             if math.hypot(tail[0] - s_start[0], tail[1] - s_start[1]) <= tol:
-                chain.extend(s[1:])
-                used.add(idx)
-                changed = True
-                break
+                t_curr = get_tangent(chain, at_start=False)
+                t_next = get_tangent(s, at_start=True)
+                dot = t_curr[0] * t_next[0] + t_curr[1] * t_next[1]
+                if dot > 0.4:
+                    chain.extend(s[1:])
+                    used.add(idx)
+                    changed = True
+                    break
             elif math.hypot(tail[0] - s_end[0], tail[1] - s_end[1]) <= tol:
-                chain.extend(list(reversed(s))[1:])
-                used.add(idx)
-                changed = True
-                break
+                t_curr = get_tangent(chain, at_start=False)
+                s_rev = list(reversed(s))
+                t_next = get_tangent(s_rev, at_start=True)
+                dot = t_curr[0] * t_next[0] + t_curr[1] * t_next[1]
+                if dot > 0.4:
+                    chain.extend(s_rev[1:])
+                    used.add(idx)
+                    changed = True
+                    break
+            # Head connection
             elif math.hypot(head[0] - s_end[0], head[1] - s_end[1]) <= tol:
-                chain = list(s[:-1]) + chain
-                used.add(idx)
-                changed = True
-                break
+                t_prev = get_tangent(s, at_start=False)
+                t_curr = get_tangent(chain, at_start=True)
+                dot = t_prev[0] * t_curr[0] + t_prev[1] * t_curr[1]
+                if dot > 0.4:
+                    chain = list(s[:-1]) + chain
+                    used.add(idx)
+                    changed = True
+                    break
             elif math.hypot(head[0] - s_start[0], head[1] - s_start[1]) <= tol:
-                chain = list(reversed(s))[:-1] + chain
-                used.add(idx)
-                changed = True
-                break
+                s_rev = list(reversed(s))
+                t_prev = get_tangent(s_rev, at_start=False)
+                t_curr = get_tangent(chain, at_start=True)
+                dot = t_prev[0] * t_curr[0] + t_prev[1] * t_curr[1]
+                if dot > 0.4:
+                    chain = list(s_rev[:-1]) + chain
+                    used.add(idx)
+                    changed = True
+                    break
 
     is_vn = _is_vn2000(chain[0][0], chain[0][1])
     if is_vn:
@@ -728,11 +769,17 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
     polygon_pts = left_pts + list(reversed(right_pts)) + [left_pts[0]]
 
     # Project to WGS-84 [lon, lat] via pyproj if needed
+    effective_cm = central_meridian if (central_meridian and central_meridian > 0) else detect_central_meridian(chain[0][0])
     if is_vn:
-        cl_wgs = project_to_wgs84(chain)
-        poly_wgs = project_to_wgs84(polygon_pts)
-        left_wgs = project_to_wgs84(left_pts)
-        right_wgs = project_to_wgs84(right_pts)
+        tf_custom = make_vn2000_transformer(effective_cm)
+        def proj_custom(pts):
+            lons, lats = tf_custom.transform([p[0] for p in pts], [p[1] for p in pts])
+            return [[float(lo), float(la)] for lo, la in zip(lons, lats)]
+
+        cl_wgs = proj_custom(chain)
+        poly_wgs = proj_custom(polygon_pts)
+        left_wgs = proj_custom(left_pts)
+        right_wgs = proj_custom(right_pts)
     else:
         cl_wgs = chain
         poly_wgs = polygon_pts
@@ -757,6 +804,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         "roadName": "\u0054\u0075\u0079\u1ebf\u006e\u0020\u0111\u01b0\u1edd\u006e\u0067\u0020\u0063\u0068\u00ed\u006e\u0068",
         "roadWidth": road_width,
         "totalLengthMeters": round(tot_len, 2),
+        "centralMeridian": effective_cm,
         "bounds": bounds,
         "centerline": centerline,
         "roadSurfacePolygon": road_surface_poly,
@@ -979,6 +1027,7 @@ def main():
     rpp.add_argument("dxf_path")
     rpp.add_argument("--width", type=float, default=7.0, help="Road width in meters")
     rpp.add_argument("--layer", default=None, help="Force centerline layer")
+    rpp.add_argument("--cm", type=float, default=None, help="Custom Central Meridian (e.g. 105.75, 105.5, 105.0)")
     rp = sub.add_parser("render")
     rp.add_argument("dxf_path")
     rp.add_argument("--size", type=int, default=4096)
@@ -1003,7 +1052,8 @@ def main():
             print(json.dumps(parse_road(
                 args.dxf_path,
                 road_width=getattr(args, "width", 7.0),
-                target_layer=getattr(args, "layer", None)
+                target_layer=getattr(args, "layer", None),
+                central_meridian=getattr(args, "cm", None)
             ), ensure_ascii=False))
         elif args.command == "render":
             print(json.dumps(render_dxf_to_png(

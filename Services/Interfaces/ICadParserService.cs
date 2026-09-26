@@ -96,6 +96,7 @@ namespace RoadGuard.CadParser.Services.Interfaces
             IFormFile file,
             double roadWidth = 7.0,
             string? centerlineLayerName = null,
+            double? centralMeridian = null,
             CancellationToken cancellationToken = default);
     }
 }

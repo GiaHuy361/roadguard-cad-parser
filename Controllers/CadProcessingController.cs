@@ -369,6 +369,7 @@ namespace RoadGuard.CadParser.Controllers
                     request.File,
                     request.RoadWidth > 0 ? request.RoadWidth : 7.0,
                     request.CenterlineLayerName,
+                    request.CentralMeridian,
                     cancellationToken).ConfigureAwait(false);
 
                 if (!result.Success)

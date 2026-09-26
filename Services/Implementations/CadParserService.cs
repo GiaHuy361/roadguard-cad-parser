@@ -169,6 +169,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             IFormFile file,
             double roadWidth = 7.0,
             string? centerlineLayerName = null,
+            double? centralMeridian = null,
             CancellationToken cancellationToken = default)
         {
             ValidateFile(file);
@@ -185,6 +186,10 @@ namespace RoadGuard.CadParser.Services.Implementations
                 if (!string.IsNullOrWhiteSpace(centerlineLayerName))
                 {
                     bridgeArgs += $" --layer \"{centerlineLayerName}\"";
+                }
+                if (centralMeridian.HasValue && centralMeridian.Value > 0)
+                {
+                    bridgeArgs += $" --cm {centralMeridian.Value}";
                 }
 
                 var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);

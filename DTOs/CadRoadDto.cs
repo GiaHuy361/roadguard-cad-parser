@@ -10,6 +10,7 @@ namespace RoadGuard.CadParser.DTOs
         public IFormFile File { get; set; } = null!;
         public double RoadWidth { get; set; } = 7.0;
         public string? CenterlineLayerName { get; set; }
+        public double? CentralMeridian { get; set; }
     }
 
     public sealed class CadParseRoadResponse
@@ -29,6 +30,10 @@ namespace RoadGuard.CadParser.DTOs
         [JsonProperty("totalLengthMeters")]
         [JsonPropertyName("totalLengthMeters")]
         public double TotalLengthMeters { get; set; }
+
+        [JsonProperty("centralMeridian")]
+        [JsonPropertyName("centralMeridian")]
+        public double? CentralMeridian { get; set; }
 
         [JsonProperty("bounds")]
         [JsonPropertyName("bounds")]
