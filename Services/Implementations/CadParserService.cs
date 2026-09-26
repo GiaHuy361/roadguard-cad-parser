@@ -10,6 +10,7 @@ using GeoJSON.Net.Geometry;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using NetTopologySuite.Geometries;
+using NetTopologySuite.LinearReferencing;
 using netDxf;
 using netDxf.Entities;
 using netDxf.Tables;
@@ -116,76 +117,100 @@ namespace RoadGuard.CadParser.Services.Implementations
             await file.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
             stream.Position = 0;
 
-            // ── 3. Load DXF document ─────────────────────────────────────── //
-            DxfDocument dxfDoc;
-            try
+            // 3. Offload CPU-bound DXF parsing, tessellation, stationing, and analytics to thread pool
+            var (features, warnings, featuresByLayer, analytics) = await Task.Run(() =>
             {
-                dxfDoc = DxfDocument.Load(stream);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "DxfDocument.Load failed for '{FileName}'.", file.FileName);
-                throw new InvalidOperationException(
-                    $"The file '{file.FileName}' could not be parsed as a DXF document. " +
-                    $"It may be corrupted or in an unsupported DXF version. Details: {ex.Message}", ex);
-            }
+                cancellationToken.ThrowIfCancellationRequested();
 
-            if (dxfDoc is null)
-                throw new InvalidOperationException(
-                    $"DxfDocument.Load returned null for '{file.FileName}'. The file may be empty or corrupted.");
+                DxfDocument dxfDoc;
+                try
+                {
+                    dxfDoc = DxfDocument.Load(stream);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "DxfDocument.Load failed for '{FileName}'.", file.FileName);
+                    throw new InvalidOperationException(
+                        $"The file '{file.FileName}' could not be parsed as a DXF document. " +
+                        $"It may be corrupted or in an unsupported DXF version. Details: {ex.Message}", ex);
+                }
 
-            // ── 4. Extract all features across all layers ────────────────── //
-            var features        = new List<Feature>();
-            var warnings        = new List<string>();
-            var featuresByLayer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+                if (dxfDoc is null)
+                    throw new InvalidOperationException(
+                        $"DxfDocument.Load returned null for '{file.FileName}'. The file may be empty or corrupted.");
 
-            ProcessAllEntities(dxfDoc, features, warnings, featuresByLayer,
-                               tessellationSegments, srid);
+                cancellationToken.ThrowIfCancellationRequested();
 
-            GenerateRoadSurfaceBuffers(features, featuresByLayer, roadWidth, srid);
+                var feats   = new List<Feature>();
+                var warns   = new List<string>();
+                var byLayer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                // Step 3: Complex entities (Arc, Spline, Polyline with bulges)
+                ProcessAllEntities(dxfDoc, feats, warns, byLayer, tessellationSegments, srid);
+
+                // Step 2: Physical stationing points via Linear Referencing
+                var stations = GenerateStationPoints(feats, byLayer, segmentLength, srid);
+
+                // Step 4 Bonus: Generate RoadSurface buffer polygon for Centerline features
+                GenerateRoadSurfaceBuffers(feats, byLayer, roadWidth, srid);
+
+                // Analytics calculation
+                stopwatch.Stop();
+                double rawLen = 0.0;
+                foreach (var feat in feats)
+                {
+                    if (feat.Properties.TryGetValue("isGeneratedBuffer", out var isGen) && isGen is true)
+                        continue;
+                    if (feat.Properties.TryGetValue("layerType", out var lt) &&
+                        lt is string sLt && string.Equals(sLt, "StationPoint", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    switch (feat.Geometry)
+                    {
+                        case GjsLineStr ls:
+                            var lsCoords = ls.Coordinates;
+                            for (int i = 1; i < lsCoords.Count; i++)
+                            {
+                                double dx = lsCoords[i].Longitude - lsCoords[i - 1].Longitude;
+                                double dy = lsCoords[i].Latitude  - lsCoords[i - 1].Latitude;
+                                rawLen += Math.Sqrt(dx * dx + dy * dy);
+                            }
+                            break;
+                        case GjsPolygon poly:
+                            if (poly.Coordinates.Count > 0)
+                            {
+                                var ring = poly.Coordinates[0].Coordinates;
+                                for (int i = 1; i < ring.Count; i++)
+                                {
+                                    double dx = ring[i].Longitude - ring[i - 1].Longitude;
+                                    double dy = ring[i].Latitude  - ring[i - 1].Latitude;
+                                    rawLen += Math.Sqrt(dx * dx + dy * dy);
+                                }
+                            }
+                            break;
+                    }
+                }
+
+                double totalMeters  = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
+                double totalAreaSqm = Math.Round(totalMeters * roadWidth, 2);
+                int estimatedSlabs  = (int)Math.Ceiling(totalMeters / slabLength);
+                int roadSegments    = stations.Count > 0 ? stations.Count : (int)Math.Ceiling(totalMeters / segmentLength);
+
+                var engAnalytics = new EngineeringAnalytics
+                {
+                    TotalLengthMeters      = Math.Round(totalMeters, 3),
+                    TotalAreaSqm           = totalAreaSqm,
+                    EstimatedConcreteSlabs = estimatedSlabs,
+                    RoadSegments           = roadSegments,
+                    ProcessingTimeMs       = stopwatch.ElapsedMilliseconds
+                };
+
+                return (feats, warns, byLayer, engAnalytics);
+            }, cancellationToken).ConfigureAwait(false);
 
             _logger.LogInformation(
                 "Parse complete: {Count} features, {Layers} layer(s), {Warns} warning(s).",
                 features.Count, featuresByLayer.Count, warnings.Count);
-
-            // -- Analytics (TCVN 10380:2014) & Dynamic Spatial Math --
-            stopwatch.Stop();
-            const double MetersPerDegree = 111320.0;
-            double rawLen = 0.0;
-            foreach (var feat in features)
-            {
-                if (feat.Properties.TryGetValue("isGeneratedBuffer", out var isGen) && isGen is true)
-                    continue;
-
-                switch (feat.Geometry)
-                {
-                    case GjsLineStr ls:
-                        var lsCoords = ls.Coordinates;
-                        for (int i = 1; i < lsCoords.Count; i++)
-                        {
-                            double dx = lsCoords[i].Longitude - lsCoords[i-1].Longitude;
-                            double dy = lsCoords[i].Latitude  - lsCoords[i-1].Latitude;
-                            rawLen += Math.Sqrt(dx*dx + dy*dy);
-                        }
-                        break;
-                    case GjsPolygon poly:
-                        if (poly.Coordinates.Count > 0)
-                        {
-                            var ring = poly.Coordinates[0].Coordinates;
-                            for (int i = 1; i < ring.Count; i++)
-                            {
-                                double dx = ring[i].Longitude - ring[i-1].Longitude;
-                                double dy = ring[i].Latitude  - ring[i-1].Latitude;
-                                rawLen += Math.Sqrt(dx*dx + dy*dy);
-                            }
-                        }
-                        break;
-                }
-            }
-            double totalMeters  = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
-            double totalAreaSqm = Math.Round(totalMeters * roadWidth, 2);
-            int estimatedSlabs  = (int)Math.Ceiling(totalMeters / slabLength);
-            int roadSegments    = (int)Math.Ceiling(totalMeters / segmentLength);
 
             // Step 5: Database Persistence
             await PersistToDatabaseAsync(file.FileName, srid, features, cancellationToken).ConfigureAwait(false);
@@ -198,14 +223,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                 FeatureCountByLayer = featuresByLayer,
                 FeatureCollection   = new FeatureCollection(features),
                 Warnings            = warnings,
-                Analytics           = new EngineeringAnalytics
-                {
-                    TotalLengthMeters      = Math.Round(totalMeters, 3),
-                    TotalAreaSqm           = totalAreaSqm,
-                    EstimatedConcreteSlabs = estimatedSlabs,
-                    RoadSegments           = roadSegments,
-                    ProcessingTimeMs       = stopwatch.ElapsedMilliseconds
-                }
+                Analytics           = analytics
             };
         }
 
@@ -236,6 +254,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             Dispatch(dxfDoc.Arcs,         e => MapArc(e, tessSegs),         features, warnings, featuresByLayer);
             // Circle ─────── full circle → closed polygon ring
             Dispatch(dxfDoc.Circles,      e => MapCircle(e, tessSegs),      features, warnings, featuresByLayer);
+            Dispatch(dxfDoc.Splines,      e => MapSpline(e, tessSegs),      features, warnings, featuresByLayer);
             // Point ──────── single coordinate
             Dispatch(dxfDoc.Points,       e => MapPoint(e),                 features, warnings, featuresByLayer);
             // Hatch ──────── filled region bounded by edges
@@ -349,7 +368,7 @@ namespace RoadGuard.CadParser.Services.Implementations
 
             // Vector3 exposes .X and .Y directly
             var coords = verts
-                .Select(v => new NtsCoordinate(v.Position.X, v.Position.Y))
+                .Select(v => (NtsCoordinate)new CoordinateZ(v.Position.X, v.Position.Y, v.Position.Z))
                 .ToList();
 
             if (poly.IsClosed && coords.Count >= 3)
@@ -367,9 +386,9 @@ namespace RoadGuard.CadParser.Services.Implementations
         /// </summary>
         private static IGeometryObject? MapLine(Line line)
         {
-            var start = new NtsCoordinate(line.StartPoint.X, line.StartPoint.Y);
-            var end   = new NtsCoordinate(line.EndPoint.X,   line.EndPoint.Y);
-            if (start.Equals2D(end)) return null; // degenerate
+            var start = new CoordinateZ(line.StartPoint.X, line.StartPoint.Y, line.StartPoint.Z);
+            var end   = new CoordinateZ(line.EndPoint.X,   line.EndPoint.Y,   line.EndPoint.Z);
+            if (start.Equals2D(end)) return null;
 
             return ToGjsLineString(new List<NtsCoordinate> { start, end });
         }
@@ -380,12 +399,15 @@ namespace RoadGuard.CadParser.Services.Implementations
         /// </summary>
         private static IGeometryObject? MapArc(Arc arc, int tessSegs)
         {
-            var coords = CurveTessellationHelper.TessellateArc(
+            var rawCoords = CurveTessellationHelper.TessellateArc(
                 arc.Center.X, arc.Center.Y,
                 arc.Radius,
                 arc.StartAngle, arc.EndAngle,
                 isCcw: true,
                 segmentsPerCircle: tessSegs);
+
+            double z = arc.Center.Z;
+            var coords = rawCoords.Select(c => (NtsCoordinate)new CoordinateZ(c.X, c.Y, z)).ToList();
 
             return CurveTessellationHelper.HasMinimumPoints(coords)
                 ? ToGjsLineString(coords)
@@ -398,10 +420,13 @@ namespace RoadGuard.CadParser.Services.Implementations
         /// </summary>
         private static IGeometryObject? MapCircle(Circle circle, int tessSegs)
         {
-            var coords = CurveTessellationHelper.TessellateCircle(
+            var rawCoords = CurveTessellationHelper.TessellateCircle(
                 circle.Center.X, circle.Center.Y,
                 circle.Radius,
                 segmentsPerCircle: tessSegs);
+
+            double z = circle.Center.Z;
+            var coords = rawCoords.Select(c => (NtsCoordinate)new CoordinateZ(c.X, c.Y, z)).ToList();
 
             return CurveTessellationHelper.HasMinimumPoints(coords, 4)
                 ? ToGjsPolygon(coords)
@@ -413,8 +438,56 @@ namespace RoadGuard.CadParser.Services.Implementations
         /// Point.Position is Vector3 in netDxf 2.1.1.
         /// GeoJSON Position takes (latitude=Y, longitude=X).
         /// </summary>
+        private static IGeometryObject? MapSpline(Spline spline, int tessSegs)
+        {
+            List<netDxf.Vector3>? vertexes = null;
+
+            if (spline.ControlPoints is not null && spline.ControlPoints.Count > 0)
+            {
+                try
+                {
+                    int precision = Math.Clamp(tessSegs / 2, 16, 128);
+                    vertexes = spline.PolygonalVertexes(precision);
+                }
+                catch
+                {
+                    // Fall back to fit points or control points
+                }
+            }
+
+            if (vertexes is null || vertexes.Count < 2)
+            {
+                if (spline.FitPoints is not null && spline.FitPoints.Count >= 2)
+                {
+                    vertexes = spline.FitPoints;
+                }
+                else if (spline.ControlPoints is not null && spline.ControlPoints.Count >= 2)
+                {
+                    vertexes = spline.ControlPoints.Select(cp => cp.Position).ToList();
+                }
+            }
+
+            if (vertexes is null || vertexes.Count < 2) return null;
+
+            var coords = vertexes
+                .Select(v => (NtsCoordinate)new CoordinateZ(v.X, v.Y, v.Z))
+                .ToList();
+
+            if (spline.IsClosed)
+            {
+                CloseRing(coords);
+                return CurveTessellationHelper.HasMinimumPoints(coords, 4)
+                    ? ToGjsPolygon(coords)
+                    : null;
+            }
+
+            return CurveTessellationHelper.HasMinimumPoints(coords)
+                ? ToGjsLineString(coords)
+                : null;
+        }
+
         private static IGeometryObject MapPoint(netDxf.Entities.Point pt)
-            => new GjsPoint(new GjsPosition(pt.Position.Y, pt.Position.X));
+            => new GjsPoint(new GjsPosition(pt.Position.Y, pt.Position.X, pt.Position.Z));
 
         /// <summary>
         /// Maps a Hatch entity by extracting its boundary path edges.
@@ -504,7 +577,7 @@ namespace RoadGuard.CadParser.Services.Implementations
         private static GjsLineStr ToGjsLineString(IList<NtsCoordinate> coords)
         {
             var positions = coords
-                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X))
+                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
                 .ToList();
             return new GjsLineStr(positions);
         }
@@ -516,7 +589,7 @@ namespace RoadGuard.CadParser.Services.Implementations
         private static GjsPolygon ToGjsPolygon(IList<NtsCoordinate> coords)
         {
             var positions = coords
-                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X))
+                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
                 .ToList();
             // GeoJSON.Net Polygon takes a list of LineString rings
             var ring = new GjsLineStr(positions);
@@ -527,7 +600,7 @@ namespace RoadGuard.CadParser.Services.Implementations
         private static void CloseRing(List<NtsCoordinate> coords)
         {
             if (coords.Count > 0 && !coords[0].Equals2D(coords[^1]))
-                coords.Add(new NtsCoordinate(coords[0].X, coords[0].Y));
+                coords.Add(new CoordinateZ(coords[0].X, coords[0].Y, coords[0].Z));
         }
 
         // ================================================================== //
@@ -549,11 +622,16 @@ namespace RoadGuard.CadParser.Services.Implementations
                 : layer.Color;
 
             string colorHex = aciColor is not null ? AciToHex(aciColor.Index) : "#FFFFFF";
+            double elevation = GetEntityElevation(entity);
 
             return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
             {
                 // UI layer classification
-                ["layerType"]       = DetermineLayerType(entity),
+                ["layerType"]        = DetermineLayerType(entity),
+
+                // Z-Axis elevation metadata (Step 1)
+                ["averageElevation"] = Math.Round(elevation, 3),
+                ["elevation"]        = Math.Round(elevation, 3),
                 // Layer metadata — populated dynamically from whatever layers exist in the DXF
                 ["layerName"]       = layer.Name,
                 ["layerColor"]      = colorHex,
@@ -639,6 +717,115 @@ namespace RoadGuard.CadParser.Services.Implementations
         //  Private - Layer Classification & Surface Buffer Generator         //
         // ================================================================== //
 
+        private static double GetEntityElevation(EntityObject entity) => entity switch
+        {
+            Line l => (l.StartPoint.Z + l.EndPoint.Z) / 2.0,
+            LwPolyline lw => lw.Elevation,
+            Polyline p when p.Vertexes.Count > 0 => p.Vertexes.Average(v => v.Position.Z),
+            netDxf.Entities.Point pt => pt.Position.Z,
+            Arc a => a.Center.Z,
+            Circle c => c.Center.Z,
+            Spline s when s.ControlPoints.Count > 0 => s.ControlPoints.Average(cp => cp.Position.Z),
+            Hatch h => h.Elevation,
+            _ => 0.0
+        };
+
+        private static List<Feature> GenerateStationPoints(
+            List<Feature> features,
+            Dictionary<string, int> featuresByLayer,
+            double segmentLength,
+            int srid)
+        {
+            var stationFeatures = new List<Feature>();
+            var ntsFactory = new NtsGeometryFactory(new NtsPrecisionModel(), srid);
+            int stationCounter = 0;
+
+            foreach (var feat in features)
+            {
+                if (!feat.Properties.TryGetValue("layerType", out var lt) ||
+                    lt is not string typeStr ||
+                    !string.Equals(typeStr, "Centerline", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (feat.Geometry is not GjsLineStr lineStr || lineStr.Coordinates.Count < 2)
+                    continue;
+
+                var ntsCoords = lineStr.Coordinates
+                    .Select(c => (NtsCoordinate)new CoordinateZ(c.Longitude, c.Latitude, c.Altitude ?? 0.0))
+                    .ToArray();
+                var ntsLine = ntsFactory.CreateLineString(ntsCoords);
+                if (ntsLine.Length <= 1e-9) continue;
+
+                var indexedLine = new LengthIndexedLine(ntsLine);
+                double lineLengthNative = ntsLine.Length;
+                double lineLengthMeters = (srid == 4326) ? (lineLengthNative * MetersPerDegree) : lineLengthNative;
+
+                for (double distMeters = 0.0; distMeters <= lineLengthMeters + 1e-4; distMeters += segmentLength)
+                {
+                    double distNative = (srid == 4326) ? (distMeters / MetersPerDegree) : distMeters;
+                    distNative = Math.Clamp(distNative, indexedLine.StartIndex, indexedLine.EndIndex);
+
+                    var ptCoord = indexedLine.ExtractPoint(distNative);
+
+                    // Interpolate exact 3D Z elevation at distNative along the centerline
+                    double z = 0.0;
+                    double accumDist = 0.0;
+                    var coordsList = lineStr.Coordinates;
+                    for (int i = 1; i < coordsList.Count; i++)
+                    {
+                        double segDx = coordsList[i].Longitude - coordsList[i-1].Longitude;
+                        double segDy = coordsList[i].Latitude  - coordsList[i-1].Latitude;
+                        double segLen = Math.Sqrt(segDx * segDx + segDy * segDy);
+
+                        if (accumDist + segLen >= distNative - 1e-9 || i == coordsList.Count - 1)
+                        {
+                            double t = segLen > 1e-9 ? Math.Clamp((distNative - accumDist) / segLen, 0.0, 1.0) : 0.0;
+                            double z1 = coordsList[i-1].Altitude ?? 0.0;
+                            double z2 = coordsList[i].Altitude ?? z1;
+                            z = z1 + t * (z2 - z1);
+                            break;
+                        }
+                        accumDist += segLen;
+                    }
+
+                    var gjsPoint = new GjsPoint(new GjsPosition(ptCoord.Y, ptCoord.X, z));
+
+                    string stationName = $"SEG-{stationCounter:D2}";
+                    var stationProps = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                    {
+                        ["layerName"]        = "STATION_POINTS",
+                        ["layerType"]        = "StationPoint",
+                        ["stationName"]      = stationName,
+                        ["distance"]         = Math.Round(distMeters, 2),
+                        ["averageElevation"] = Math.Round(z, 3),
+                        ["elevation"]        = Math.Round(z, 3),
+                        ["layerColor"]       = "#EF4444",
+                        ["layerLineweight"]  = "default",
+                        ["layerLinetype"]    = "CONTINUOUS",
+                        ["layerIsVisible"]   = true,
+                        ["layerIsFrozen"]    = false,
+                        ["entityType"]       = "Point",
+                        ["entityHandle"]     = $"STATION_{stationCounter}"
+                    };
+
+                    stationFeatures.Add(new Feature(gjsPoint, stationProps));
+                    stationCounter++;
+                }
+            }
+
+            if (stationFeatures.Count > 0)
+            {
+                features.AddRange(stationFeatures);
+                featuresByLayer["STATION_POINTS"] = featuresByLayer.TryGetValue("STATION_POINTS", out var cur)
+                    ? cur + stationFeatures.Count
+                    : stationFeatures.Count;
+            }
+
+            return stationFeatures;
+        }
+
         private static string DetermineLayerType(EntityObject entity)
         {
             var layerName = entity.Layer?.Name?.ToUpperInvariant() ?? string.Empty;
@@ -680,7 +867,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                         if (bufferedGeom is NtsPolygon ntsPoly && !ntsPoly.IsEmpty)
                         {
                             var shellCoords = ntsPoly.ExteriorRing.Coordinates
-                                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X))
+                                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
                                 .ToList();
                             var gjsRing = new GjsLineStr(shellCoords);
                             var gjsPoly = new GjsPolygon(new List<GjsLineStr> { gjsRing });
@@ -755,7 +942,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                             break;
 
                         case GjsPoint pt:
-                            geom = ntsFactory.CreatePoint(new NtsCoordinate(pt.Coordinates.Longitude, pt.Coordinates.Latitude));
+                            geom = ntsFactory.CreatePoint(new CoordinateZ(pt.Coordinates.Longitude, pt.Coordinates.Latitude, pt.Coordinates.Altitude ?? 0.0));
                             break;
                     }
 

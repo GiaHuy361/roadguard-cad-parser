@@ -245,13 +245,36 @@ namespace RoadGuard.CadParser.Controllers
             };
             doc.AddEntity(rect);
 
+            rect.Elevation = 10.5;
+
             var centerline = new Line(
-                new netDxf.Vector3(106.700, 10.805, 0),
-                new netDxf.Vector3(106.710, 10.805, 0))
+                new netDxf.Vector3(106.700, 10.805, 12.0),
+                new netDxf.Vector3(106.710, 10.805, 15.0))
             {
                 Layer = new Layer("ROAD_CENTERLINE")
             };
             doc.AddEntity(centerline);
+
+            // Arc with 3D elevation
+            var arc = new Arc(new netDxf.Vector3(106.705, 10.808, 14.0), 0.002, 0.0, 180.0)
+            {
+                Layer = new Layer("ROAD_CURVE")
+            };
+            doc.AddEntity(arc);
+
+            // Spline with 3D control points
+            var splineControlPoints = new System.Collections.Generic.List<SplineVertex>
+            {
+                new SplineVertex(new netDxf.Vector3(106.700, 10.802, 11.0)),
+                new SplineVertex(new netDxf.Vector3(106.703, 10.803, 11.8)),
+                new SplineVertex(new netDxf.Vector3(106.707, 10.802, 12.4)),
+                new SplineVertex(new netDxf.Vector3(106.710, 10.803, 13.0))
+            };
+            var spline = new Spline(splineControlPoints)
+            {
+                Layer = new Layer("ROAD_SPLINE")
+            };
+            doc.AddEntity(spline);
 
             var stream = new MemoryStream();
             doc.Save(stream);
