@@ -47,8 +47,15 @@ _VN2000_Y_MIN =  800_000.0
 _VN2000_Y_MAX = 2_600_000.0
 
 def _is_vn2000(x, y) -> bool:
-    return (_VN2000_X_MIN <= x <= _VN2000_X_MAX and
-            _VN2000_Y_MIN <= y <= _VN2000_Y_MAX)
+    is_std = (_VN2000_X_MIN <= x <= _VN2000_X_MAX and
+              _VN2000_Y_MIN <= y <= _VN2000_Y_MAX)
+    is_swp = (_VN2000_Y_MIN <= x <= _VN2000_Y_MAX and
+              _VN2000_X_MIN <= y <= _VN2000_X_MAX)
+    return is_std or is_swp
+
+def _is_vn2000_swapped(x, y) -> bool:
+    return (_VN2000_Y_MIN <= x <= _VN2000_Y_MAX and
+            _VN2000_X_MIN <= y <= _VN2000_X_MAX)
 
 # =============================================================================
 # Projection
@@ -615,7 +622,7 @@ def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
 # Parse Road Vector & 2D Concrete Surface (GPS WGS-84 Coordinates)
 # =============================================================================
 
-def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = None, central_meridian: float = None) -> dict:
+def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = None, central_meridian: float = None, swap_xy: bool = False) -> dict:
     """
     Extracts the main road centerline from CAD and expands it by `road_width`
     into a realistic 2D concrete road surface polygon.
@@ -732,6 +739,9 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                     break
 
     is_vn = _is_vn2000(chain[0][0], chain[0][1])
+    if _is_vn2000_swapped(chain[0][0], chain[0][1]) or swap_xy:
+        chain = [(p[1], p[0]) for p in chain]
+        is_vn = True
     if is_vn:
         tot_len = sum(math.hypot(chain[i][0] - chain[i - 1][0], chain[i][1] - chain[i - 1][1]) for i in range(1, len(chain)))
         half_w = max(0.5, road_width / 2.0)
@@ -1028,6 +1038,7 @@ def main():
     rpp.add_argument("--width", type=float, default=7.0, help="Road width in meters")
     rpp.add_argument("--layer", default=None, help="Force centerline layer")
     rpp.add_argument("--cm", type=float, default=None, help="Custom Central Meridian (e.g. 105.75, 105.5, 105.0)")
+    rpp.add_argument("--swap-xy", action="store_true", default=False, help="Force swap coordinates X and Y")
     rp = sub.add_parser("render")
     rp.add_argument("dxf_path")
     rp.add_argument("--size", type=int, default=4096)
@@ -1053,7 +1064,8 @@ def main():
                 args.dxf_path,
                 road_width=getattr(args, "width", 7.0),
                 target_layer=getattr(args, "layer", None),
-                central_meridian=getattr(args, "cm", None)
+                central_meridian=getattr(args, "cm", None),
+                swap_xy=getattr(args, "swap_xy", False)
             ), ensure_ascii=False))
         elif args.command == "render":
             print(json.dumps(render_dxf_to_png(
