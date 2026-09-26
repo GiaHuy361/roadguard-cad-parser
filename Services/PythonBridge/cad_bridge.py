@@ -82,12 +82,37 @@ def extract_geometries(dxf_path, target_layer=None, srid=4326):
                 break
 
     if not chosen_layer:
-        for kw in CENTERLINE_KEYWORDS:
-            candidates = [l for l in layer_entities if re.search(r'\b' + re.escape(kw) + r'\b', l, re.I) or kw.upper() in l.upper()]
-            if candidates:
-                candidates.sort(key=lambda x: len(layer_entities[x]), reverse=True)
-                chosen_layer = candidates[0]
-                break
+        # Heuristic: Calculate total geometric length for each layer to pick the true continuous road alignment
+        layer_lengths = {}
+        for l, ents in layer_entities.items():
+            tot_len = 0.0
+            for e in ents:
+                try:
+                    p = path.make_path(e)
+                    pts = list(p.flattening(distance=1.0))
+                    for i in range(1, len(pts)):
+                        dx = pts[i].x - pts[i-1].x
+                        dy = pts[i].y - pts[i-1].y
+                        tot_len += math.sqrt(dx*dx + dy*dy)
+                except Exception:
+                    pass
+            layer_lengths[l] = tot_len
+
+        # Candidate layers matching civil engineering road keywords
+        candidates = []
+        for l, l_len in layer_lengths.items():
+            # Exclude auxiliary annotation layers like text/tick marks
+            if any(ignore in l.upper() for ignore in ['SUONTUYEN', 'DAUTIM', 'TEXT', 'GHICHU', 'COC', 'KHUNG']):
+                continue
+            for kw in CENTERLINE_KEYWORDS:
+                if re.search(r'\b' + re.escape(kw) + r'\b', l, re.I) or kw.upper() in l.upper():
+                    candidates.append((l, l_len, len(layer_entities[l])))
+                    break
+
+        if candidates:
+            # Sort by total road length descending (prefer long continuous alignment over short 7m stubs)
+            candidates.sort(key=lambda c: (c[1], c[2]), reverse=True)
+            chosen_layer = candidates[0][0]
 
     if not chosen_layer and layer_entities:
         chosen_layer = max(layer_entities.keys(), key=lambda l: len(layer_entities[l]))
