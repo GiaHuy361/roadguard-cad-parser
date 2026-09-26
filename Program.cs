@@ -94,10 +94,10 @@ builder.Services.AddSwaggerGen(c =>
 // ── CORS (configurable for production) ──────────────────────────────────── //
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("CadParserCorsPolicy", policy =>
+    options.AddPolicy("AllowAll", policy =>
     {
         policy
-            .AllowAnyOrigin()   // Tighten to specific origins in production
+            .AllowAnyOrigin()
             .AllowAnyMethod()
             .AllowAnyHeader();
     });
@@ -128,9 +128,14 @@ else
     app.UseHsts();
 }
 
-app.UseHttpsRedirection();
-app.UseCors("AllowAll");
+// Only enforce HTTPS redirection in Production so local HTTP dev works seamlessly with Vite (http://localhost:5173)
+if (!app.Environment.IsDevelopment())
+{
+    app.UseHttpsRedirection();
+}
+
 app.UseRouting();
+app.UseCors("AllowAll");
 app.UseAuthorization();
 app.MapControllers();
 app.MapHealthChecks("/health");
