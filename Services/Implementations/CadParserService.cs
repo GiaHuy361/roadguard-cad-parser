@@ -844,64 +844,117 @@ namespace RoadGuard.CadParser.Services.Implementations
             double roadWidth,
             int srid)
         {
+            if (roadWidth <= 0) return;
+
             double bufferDistance = (srid == 4326) ? (roadWidth / 2.0) / MetersPerDegree : (roadWidth / 2.0);
             var bufferFeatures = new List<Feature>();
             var ntsFactory = new NtsGeometryFactory(new NtsPrecisionModel(), srid);
 
+            // Step 1: Identify continuous LineString or merged geometries representing the Centerline
+            var centerlineGeoms = new List<NtsGeometry.Geometry>();
             foreach (var feat in features)
             {
+                if (feat.Properties.TryGetValue("isGeneratedBuffer", out var isGen) && isGen is true)
+                    continue;
+
                 if (feat.Properties.TryGetValue("layerType", out var lt) &&
                     lt is string typeStr &&
                     string.Equals(typeStr, "Centerline", StringComparison.OrdinalIgnoreCase) &&
                     feat.Geometry is GjsLineStr lineStr &&
                     lineStr.Coordinates.Count >= 2)
                 {
-                    try
-                    {
-                        var ntsCoords = lineStr.Coordinates
-                            .Select(c => new NtsCoordinate(c.Longitude, c.Latitude))
-                            .ToArray();
-                        var ntsLine = ntsFactory.CreateLineString(ntsCoords);
-                        var bufferedGeom = ntsLine.Buffer(bufferDistance);
-
-                        if (bufferedGeom is NtsPolygon ntsPoly && !ntsPoly.IsEmpty)
-                        {
-                            var shellCoords = ntsPoly.ExteriorRing.Coordinates
-                                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
-                                .ToList();
-                            var gjsRing = new GjsLineStr(shellCoords);
-                            var gjsPoly = new GjsPolygon(new List<GjsLineStr> { gjsRing });
-
-                            var bufferProps = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
-                            {
-                                ["layerName"]        = "ROAD_SURFACE",
-                                ["layerType"]        = "RoadSurface",
-                                ["layerColor"]       = "#3B82F6",
-                                ["layerLineweight"]  = "default",
-                                ["layerLinetype"]    = "CONTINUOUS",
-                                ["layerIsVisible"]   = true,
-                                ["layerIsFrozen"]    = false,
-                                ["entityType"]       = "Polygon",
-                                ["entityHandle"]     = "GEN_SURFACE",
-                                ["isGeneratedBuffer"] = true
-                            };
-
-                            bufferFeatures.Add(new Feature(gjsPoly, bufferProps));
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogDebug(ex, "Failed to create road surface buffer for centerline feature.");
-                    }
+                    var ntsCoords = lineStr.Coordinates
+                        .Select(c => new NtsCoordinate(c.Longitude, c.Latitude))
+                        .ToArray();
+                    centerlineGeoms.Add(ntsFactory.CreateLineString(ntsCoords));
                 }
             }
 
-            if (bufferFeatures.Count > 0)
+            if (centerlineGeoms.Count == 0)
             {
-                features.AddRange(bufferFeatures);
-                featuresByLayer["ROAD_SURFACE"] = featuresByLayer.TryGetValue("ROAD_SURFACE", out var cur)
-                    ? cur + bufferFeatures.Count
-                    : bufferFeatures.Count;
+                _logger.LogDebug("No centerline geometries found to generate road surface buffer.");
+                return;
+            }
+
+            try
+            {
+                // Step 2: Merge geometries representing the continuous Centerline
+                NtsGeometry.Geometry centerlineGeometry = centerlineGeoms.Count == 1
+                    ? centerlineGeoms[0]
+                    : ntsFactory.CreateMultiLineString(centerlineGeoms.Cast<NtsGeometry.LineString>().ToArray());
+
+                // Step 3: Apply the NTS Buffer operation (exact buffered shape following the curve of the centerline)
+                var roadPolygon = centerlineGeometry.Buffer(bufferDistance);
+
+                if (roadPolygon is not null && !roadPolygon.IsEmpty)
+                {
+                    void AddPolygonFeature(NtsPolygon ntsPoly)
+                    {
+                        if (ntsPoly.IsEmpty) return;
+
+                        var shellCoords = ntsPoly.ExteriorRing.Coordinates
+                            .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
+                            .ToList();
+
+                        var rings = new List<GjsLineStr> { new GjsLineStr(shellCoords) };
+
+                        for (int i = 0; i < ntsPoly.NumInteriorRings; i++)
+                        {
+                            var hole = ntsPoly.GetInteriorRingN(i);
+                            var holeCoords = hole.Coordinates
+                                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
+                                .ToList();
+                            rings.Add(new GjsLineStr(holeCoords));
+                        }
+
+                        var gjsPoly = new GjsPolygon(rings);
+
+                        var bufferProps = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["layerType"]         = "RoadSurface",
+                            ["layerName"]         = "ROAD_SURFACE_2D",
+                            ["isGeneratedBuffer"] = true,
+                            ["roadWidth"]         = roadWidth,
+                            ["material"]          = "asphalt",
+                            ["layerColor"]        = "#334155",
+                            ["layerLineweight"]   = "default",
+                            ["layerLinetype"]     = "CONTINUOUS",
+                            ["layerIsVisible"]    = true,
+                            ["layerIsFrozen"]     = false,
+                            ["entityType"]        = "Polygon",
+                            ["entityHandle"]      = "GEN_ROAD_SURFACE_2D"
+                        };
+
+                        bufferFeatures.Add(new Feature(gjsPoly, bufferProps));
+                    }
+
+                    if (roadPolygon is NtsPolygon singlePoly)
+                    {
+                        AddPolygonFeature(singlePoly);
+                    }
+                    else if (roadPolygon is NtsMultiPolygon multiPoly)
+                    {
+                        for (int i = 0; i < multiPoly.NumGeometries; i++)
+                        {
+                            if (multiPoly.GetGeometryN(i) is NtsPolygon partPoly)
+                            {
+                                AddPolygonFeature(partPoly);
+                            }
+                        }
+                    }
+
+                    if (bufferFeatures.Count > 0)
+                    {
+                        features.AddRange(bufferFeatures);
+                        featuresByLayer["ROAD_SURFACE_2D"] = featuresByLayer.TryGetValue("ROAD_SURFACE_2D", out var cur)
+                            ? cur + bufferFeatures.Count
+                            : bufferFeatures.Count;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to generate road surface buffer from centerline geometry.");
             }
         }
 
