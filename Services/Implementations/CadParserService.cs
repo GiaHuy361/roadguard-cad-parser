@@ -96,6 +96,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             ValidateSrid(srid);
             tessellationSegments = Math.Max(MinTessellationSegs, tessellationSegments);
 
+            var stopwatch = Stopwatch.StartNew();
+
             _logger.LogInformation(
                 "Starting DXF parse: file={FileName}, size={Size}B, srid={Srid}, tessSegs={Segs}",
                 file.FileName, file.Length, srid, tessellationSegments);
@@ -135,6 +137,39 @@ namespace RoadGuard.CadParser.Services.Implementations
                 "Parse complete: {Count} features, {Layers} layer(s), {Warns} warning(s).",
                 features.Count, featuresByLayer.Count, warnings.Count);
 
+            // -- Analytics (TCVN 10380:2014) --
+            stopwatch.Stop();
+            const double MetersPerDegree = 111320.0;
+            double rawLen = 0.0;
+            foreach (var feat in features)
+            {
+                switch (feat.Geometry)
+                {
+                    case GjsLineStr ls:
+                        var lsCoords = ls.Coordinates;
+                        for (int i = 1; i < lsCoords.Count; i++)
+                        {
+                            double dx = lsCoords[i].Longitude - lsCoords[i-1].Longitude;
+                            double dy = lsCoords[i].Latitude  - lsCoords[i-1].Latitude;
+                            rawLen += Math.Sqrt(dx*dx + dy*dy);
+                        }
+                        break;
+                    case GjsPolygon poly:
+                        if (poly.Coordinates.Count > 0)
+                        {
+                            var ring = poly.Coordinates[0].Coordinates;
+                            for (int i = 1; i < ring.Count; i++)
+                            {
+                                double dx = ring[i].Longitude - ring[i-1].Longitude;
+                                double dy = ring[i].Latitude  - ring[i-1].Latitude;
+                                rawLen += Math.Sqrt(dx*dx + dy*dy);
+                            }
+                        }
+                        break;
+                }
+            }
+            double totalMeters = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
+
             return new GeoJsonResponse
             {
                 SourceFileName      = file.FileName,
@@ -142,7 +177,14 @@ namespace RoadGuard.CadParser.Services.Implementations
                 TotalFeatureCount   = features.Count,
                 FeatureCountByLayer = featuresByLayer,
                 FeatureCollection   = new FeatureCollection(features),
-                Warnings            = warnings
+                Warnings            = warnings,
+                Analytics           = new EngineeringAnalytics
+                {
+                    TotalLengthMeters      = Math.Round(totalMeters, 3),
+                    EstimatedConcreteSlabs = (int)(totalMeters / 4.0),
+                    RoadSegments           = (int)Math.Ceiling(totalMeters / 100.0),
+                    ProcessingTimeMs       = stopwatch.ElapsedMilliseconds
+                }
             };
         }
 
