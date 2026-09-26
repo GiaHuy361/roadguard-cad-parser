@@ -229,16 +229,17 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                     foreach (var item in pyParseResult.Features)
                     {
-                        if (item.Coordinates == null || item.Coordinates.Count < 2) continue;
+                        var itemCoords = item.GetCoordinates();
+                        if (itemCoords == null || itemCoords.Count < 2) continue;
 
                         var coords = new List<NtsCoordinate>();
-                        foreach (var pt in item.Coordinates)
+                        foreach (var pt in itemCoords)
                         {
                             if (pt.Count >= 2)
                             {
                                 double x = pt[0];
                                 double y = pt[1];
-                                double z = pt.Count >= 3 ? pt[2] : item.Elevation;
+                                double z = pt.Count >= 3 ? pt[2] : (item.Properties?.Elevation ?? item.Elevation);
                                 coords.Add(new CoordinateZ(x, y, z));
                             }
                         }
@@ -246,12 +247,14 @@ namespace RoadGuard.CadParser.Services.Implementations
                         if (coords.Count < 2) continue;
 
                         var geom = ToGjsLineString(coords);
+                        var segName = item.GetSegment() ?? $"SEG-{feats.Count + 1:D2}";
                         var props = new Dictionary<string, object>
                         {
                             ["layer"] = chosenCenterlineLayer,
                             ["layerName"] = chosenCenterlineLayer,
                             ["layerType"] = "Centerline",
-                            ["elevation"] = item.Elevation
+                            ["elevation"] = item.Properties?.Elevation ?? item.Elevation,
+                            ["segment"] = segName
                         };
 
                         feats.Add(new Feature(geom, props));
@@ -530,16 +533,45 @@ namespace RoadGuard.CadParser.Services.Implementations
             public string? Detail { get; set; }
         }
 
+        private sealed class PythonGeometryData
+        {
+            public string Type { get; set; } = "LineString";
+            public List<List<double>> Coordinates { get; set; } = new();
+        }
+
+        private sealed class PythonPropertiesData
+        {
+            public string? Layer { get; set; }
+            public string? Segment { get; set; }
+            public double Elevation { get; set; }
+        }
+
         private sealed class PythonFeatureData
         {
+            public string Type { get; set; } = "Feature";
+            public PythonPropertiesData? Properties { get; set; }
+            public PythonGeometryData? Geometry { get; set; }
+
+            // Flat/backward-compatibility fields
             public string Layer { get; set; } = string.Empty;
+            public string? Segment { get; set; }
             public double Elevation { get; set; }
-            public List<List<double>> Coordinates { get; set; } = new();
+            public List<List<double>>? Coordinates { get; set; }
+
+            public List<List<double>> GetCoordinates()
+                => Geometry?.Coordinates ?? Coordinates ?? new List<List<double>>();
+
+            public string GetLayer(string fallback = "")
+                => Properties?.Layer ?? (!string.IsNullOrEmpty(Layer) ? Layer : fallback);
+
+            public string? GetSegment()
+                => Properties?.Segment ?? Segment;
         }
 
         private sealed class PythonParseResult
         {
-            public bool Success { get; set; }
+            public string? Type { get; set; }
+            public bool Success { get; set; } = true;
             public string? DetectedLayer { get; set; }
             public int TotalEntities { get; set; }
             public List<string> Layers { get; set; } = new();
@@ -1188,7 +1220,7 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                     var gjsPoint = new GjsPoint(new GjsPosition(ptCoord.Y, ptCoord.X, z));
 
-                    string stationName = $"SEG-{stationCounter:D2}";
+                    string stationName = $"STA-{stationCounter:D2}";
                     var stationProps = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
                     {
                         ["layerName"]        = "STATION_POINTS",
