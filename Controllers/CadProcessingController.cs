@@ -1,4 +1,6 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,6 +18,23 @@ using RoadGuard.CadParser.Services.Interfaces;
 
 namespace RoadGuard.CadParser.Controllers
 {
+    /// <summary>
+    /// Form-data request model for the Get Layers endpoint.
+    /// Supports both 'dxfFile' and 'file' field names.
+    /// </summary>
+    public sealed class CadGetLayersRequest
+    {
+        /// <summary>
+        /// Uploaded DXF file field named 'dxfFile'.
+        /// </summary>
+        public IFormFile? DxfFile { get; set; }
+
+        /// <summary>
+        /// Uploaded DXF file field named 'file'.
+        /// </summary>
+        public IFormFile? File { get; set; }
+    }
+
     /// <summary>
     /// Form-data request model for the DXF parsing endpoint.
     /// Encapsulates the uploaded file and parsing options for Swashbuckle compatibility.
@@ -44,12 +63,19 @@ namespace RoadGuard.CadParser.Controllers
         public double RoadWidth { get; set; } = 3.5;
 
         public double SlabLength { get; set; } = 4.0;
+
+        /// <summary>
+        /// Name of the CAD layer representing the road centerline (passed from the frontend).
+        /// When provided, geometry extraction is dynamically filtered to this layer.
+        /// </summary>
+        public string? CenterlineLayerName { get; set; }
     }
 
     /// <summary>
     /// HTTP API surface for the RoadGuard CAD processing module.
     ///
     /// Routes:
+    ///   POST /api/cad/get-layers  - Upload a DXF file, receive a list of layer names.
     ///   POST /api/cad/parse-dxf   - Upload a DXF file, receive GeoJSON.
     ///   GET  /api/cad/health      - Liveness probe.
     /// </summary>
@@ -78,6 +104,98 @@ namespace RoadGuard.CadParser.Controllers
         }
 
         // ================================================================== //
+        //  POST /api/cad/get-layers                                           //
+        // ================================================================== //
+
+        /// <summary>
+        /// Scans an uploaded DXF file and extracts all distinct layer names.
+        /// </summary>
+        /// <param name="request">Multipart form-data containing the DXF file in 'dxfFile' or 'file'.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <response code="200">Returns a list of layer names in the uploaded DXF.</response>
+        /// <response code="400">File is missing or empty.</response>
+        /// <response code="415">Unsupported file type.</response>
+        /// <response code="422">DXF file is corrupted or unparseable.</response>
+        /// <response code="500">Internal server error.</response>
+        [HttpPost("get-layers")]
+        [Consumes("multipart/form-data")]
+        [RequestSizeLimit(104_857_600)]   // 100 MB
+        [RequestFormLimits(MultipartBodyLengthLimit = 104_857_600)]
+        [ProducesResponseType(typeof(List<string>), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status400BadRequest)]
+        [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status415UnsupportedMediaType)]
+        [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status422UnprocessableEntity)]
+        [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status500InternalServerError)]
+        public async Task<IActionResult> GetLayers(
+            [FromForm] CadGetLayersRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            var file = request?.DxfFile ?? request?.File ?? Request.Form.Files.FirstOrDefault();
+            if (file is null || file.Length == 0)
+            {
+                return BadRequest(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.BadRequest,
+                    Error      = "MissingFile",
+                    Detail     = "Request must include a non-empty file in the 'dxfFile' or 'file' form-data field."
+                });
+            }
+
+            try
+            {
+                var layers = await _parserService.GetLayersAsync(file, cancellationToken).ConfigureAwait(false);
+                return Ok(layers);
+            }
+            catch (ArgumentException ex) when (ex.Message.Contains("empty") || ex.Message.Contains("exceeds"))
+            {
+                _logger.LogWarning(ex, "Bad file argument in GetLayers.");
+                return BadRequest(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.BadRequest,
+                    Error      = "InvalidFile",
+                    Detail     = ex.Message
+                });
+            }
+            catch (NotSupportedException ex)
+            {
+                _logger.LogWarning(ex, "Unsupported file extension in GetLayers.");
+                return StatusCode(StatusCodes.Status415UnsupportedMediaType,
+                    new CadParserErrorResponse
+                    {
+                        StatusCode = (int)HttpStatusCode.UnsupportedMediaType,
+                        Error      = "UnsupportedFileType",
+                        Detail     = ex.Message
+                    });
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogWarning(ex, "DXF scan failed in GetLayers (unprocessable content).");
+                return UnprocessableEntity(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.UnprocessableEntity,
+                    Error      = "ParseFailed",
+                    Detail     = ex.Message
+                });
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("GetLayers request was cancelled.");
+                return StatusCode(StatusCodes.Status499ClientClosedRequest);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error during GetLayers scan.");
+                return StatusCode(StatusCodes.Status500InternalServerError,
+                    new CadParserErrorResponse
+                    {
+                        StatusCode = (int)HttpStatusCode.InternalServerError,
+                        Error      = "InternalServerError",
+                        Detail     = "An unexpected error occurred. Please contact the system administrator."
+                    });
+            }
+        }
+
+        // ================================================================== //
         //  POST /api/cad/parse-dxf                                            //
         // ================================================================== //
 
@@ -89,7 +207,7 @@ namespace RoadGuard.CadParser.Controllers
         /// in its Properties dictionary.
         /// </summary>
         /// <param name="request">
-        ///   Multipart form-data model containing the DXF file, target SRID, and tessellation options.
+        ///   Multipart form-data model containing the DXF file, target SRID, tessellation options, and optional centerlineLayerName.
         /// </param>
         /// <param name="cancellationToken">Propagated from the HTTP pipeline.</param>
         /// <response code="200">Parsing succeeded; body contains <see cref="GeoJsonResponse"/>.</response>
@@ -148,8 +266,8 @@ namespace RoadGuard.CadParser.Controllers
             }
 
             _logger.LogInformation(
-                "ParseDxf request received: file={Name}, size={Size}B, srid={Srid}",
-                file.FileName, file.Length, srid);
+                "ParseDxf request received: file={Name}, size={Size}B, srid={Srid}, centerlineLayer={CenterlineLayer}",
+                file.FileName, file.Length, srid, request.CenterlineLayerName ?? "(auto-detect)");
 
             try
             {
@@ -160,6 +278,7 @@ namespace RoadGuard.CadParser.Controllers
                     request.SegmentLength,
                     request.RoadWidth,
                     request.SlabLength,
+                    request.CenterlineLayerName,
                     cancellationToken).ConfigureAwait(false);
 
                 return Ok(result);

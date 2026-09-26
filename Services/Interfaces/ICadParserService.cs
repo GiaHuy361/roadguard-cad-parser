@@ -1,4 +1,5 @@
-﻿using System.Threading;
+using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using RoadGuard.CadParser.DTOs;
@@ -15,6 +16,16 @@ namespace RoadGuard.CadParser.Services.Interfaces
     /// </summary>
     public interface ICadParserService
     {
+        /// <summary>
+        /// Quickly scans an uploaded DXF file and extracts all distinct layer names.
+        /// </summary>
+        /// <param name="file">The uploaded DXF file.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>A list of unique layer names found in the DXF file.</returns>
+        Task<List<string>> GetLayersAsync(
+            IFormFile file,
+            CancellationToken cancellationToken = default);
+
         /// <summary>
         /// Parses an AutoCAD DXF file received as an <see cref="IFormFile"/> and
         /// returns a <see cref="GeoJsonResponse"/> containing a GeoJSON FeatureCollection
@@ -48,6 +59,10 @@ namespace RoadGuard.CadParser.Services.Interfaces
         ///   Length in metres per concrete slab (TCVN 10380:2014).
         ///   Defaults to 4.0 m.
         /// </param>
+        /// <param name="centerlineLayerName">
+        ///   Optional name of the CAD layer representing the road centerline.
+        ///   When specified, geometry extraction is dynamically filtered to this layer.
+        /// </param>
         /// <param name="cancellationToken">Propagates cancellation from the HTTP pipeline.</param>
         /// <returns>
         ///   A populated <see cref="GeoJsonResponse"/> on success.
@@ -60,6 +75,7 @@ namespace RoadGuard.CadParser.Services.Interfaces
             double segmentLength = 100.0,
             double roadWidth = 3.5,
             double slabLength = 4.0,
+            string? centerlineLayerName = null,
             CancellationToken cancellationToken = default);
     }
 }

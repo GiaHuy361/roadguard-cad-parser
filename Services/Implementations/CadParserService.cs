@@ -89,6 +89,52 @@ namespace RoadGuard.CadParser.Services.Implementations
         // ================================================================== //
 
         /// <inheritdoc/>
+        public async Task<List<string>> GetLayersAsync(
+            IFormFile file,
+            CancellationToken cancellationToken = default)
+        {
+            ValidateFile(file);
+
+            using var stream = new MemoryStream();
+            await file.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
+            stream.Position = 0;
+
+            return await Task.Run(() =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+
+                var dxfDoc = LoadDxfDocument(stream, file.FileName);
+
+                if (dxfDoc is null)
+                {
+                    throw new InvalidOperationException(
+                        $"DxfDocument.Load returned null for '{file.FileName}'. The file may be empty or corrupted.");
+                }
+
+                var layerNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // Collect from Layers table
+                foreach (var layer in dxfDoc.Layers)
+                {
+                    if (!string.IsNullOrWhiteSpace(layer.Name))
+                        layerNames.Add(layer.Name);
+                }
+
+                // Collect from graphic entities
+                foreach (var e in dxfDoc.LwPolylines) if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                foreach (var e in dxfDoc.Polylines)   if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                foreach (var e in dxfDoc.Lines)       if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                foreach (var e in dxfDoc.Arcs)        if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                foreach (var e in dxfDoc.Circles)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                foreach (var e in dxfDoc.Splines)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                foreach (var e in dxfDoc.Points)      if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                foreach (var e in dxfDoc.Hatches)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+
+                return layerNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+            }, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc/>
         public async Task<GeoJsonResponse> ParseDxfAsync(
             IFormFile file,
             int srid                 = 4326,
@@ -96,6 +142,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             double segmentLength     = 100.0,
             double roadWidth         = 3.5,
             double slabLength        = 4.0,
+            string? centerlineLayerName = null,
             CancellationToken cancellationToken = default)
         {
             // ── 1. Validate inputs ───────────────────────────────────────── //
@@ -122,18 +169,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
-                DxfDocument dxfDoc;
-                try
-                {
-                    dxfDoc = DxfDocument.Load(stream);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "DxfDocument.Load failed for '{FileName}'.", file.FileName);
-                    throw new InvalidOperationException(
-                        $"The file '{file.FileName}' could not be parsed as a DXF document. " +
-                        $"It may be corrupted or in an unsupported DXF version. Details: {ex.Message}", ex);
-                }
+                var dxfDoc = LoadDxfDocument(stream, file.FileName);
 
                 if (dxfDoc is null)
                     throw new InvalidOperationException(
@@ -141,18 +177,48 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                 cancellationToken.ThrowIfCancellationRequested();
 
+                // Dynamic layer validation: if centerlineLayerName is provided, verify presence and valid geometries
+                if (!string.IsNullOrWhiteSpace(centerlineLayerName))
+                {
+                    bool layerExists = dxfDoc.Layers.Any(l => string.Equals(l.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                        || dxfDoc.LwPolylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                        || dxfDoc.Polylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                        || dxfDoc.Lines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                        || dxfDoc.Splines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                        || dxfDoc.Arcs.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase));
+
+                    if (!layerExists)
+                    {
+                        throw new InvalidOperationException(
+                            $"Layer '{centerlineLayerName}' was not found in the DXF file. Please select a valid layer from the file.");
+                    }
+
+                    bool hasLinearGeometries =
+                        dxfDoc.LwPolylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase) && e.Vertexes.Count >= 2) ||
+                        dxfDoc.Polylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase) && e.Vertexes.Count >= 2) ||
+                        dxfDoc.Lines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase)) ||
+                        dxfDoc.Splines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase)) ||
+                        dxfDoc.Arcs.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase));
+
+                    if (!hasLinearGeometries)
+                    {
+                        throw new InvalidOperationException(
+                            $"The selected layer '{centerlineLayerName}' contains no valid polylines or lines to represent the road centerline.");
+                    }
+                }
+
                 var feats   = new List<Feature>();
                 var warns   = new List<string>();
                 var byLayer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
                 // Step 3: Complex entities (Arc, Spline, Polyline with bulges)
-                ProcessAllEntities(dxfDoc, feats, warns, byLayer, tessellationSegments, srid);
+                ProcessAllEntities(dxfDoc, feats, warns, byLayer, tessellationSegments, srid, centerlineLayerName);
 
                 // Step 2: Physical stationing points via Linear Referencing
-                var stations = GenerateStationPoints(feats, byLayer, segmentLength, srid);
+                var stations = GenerateStationPoints(feats, byLayer, segmentLength, srid, centerlineLayerName);
 
                 // Step 4 Bonus: Generate RoadSurface buffer polygon for Centerline features
-                GenerateRoadSurfaceBuffers(feats, byLayer, roadWidth, srid);
+                GenerateRoadSurfaceBuffers(feats, byLayer, roadWidth, srid, centerlineLayerName);
 
                 // Analytics calculation
                 stopwatch.Stop();
@@ -236,29 +302,36 @@ namespace RoadGuard.CadParser.Services.Implementations
         /// In netDxf 2.1.1, entity collections are top-level properties on DxfDocument,
         /// NOT under a nested .Entities property.
         /// </summary>
+        private static IEnumerable<T> FilterByLayer<T>(IEnumerable<T> entities, string? layerName) where T : EntityObject
+        {
+            if (string.IsNullOrWhiteSpace(layerName)) return entities;
+            return entities.Where(e => string.Equals(e.Layer?.Name, layerName, StringComparison.OrdinalIgnoreCase));
+        }
+
         private void ProcessAllEntities(
             DxfDocument             dxfDoc,
             List<Feature>           features,
             List<string>            warnings,
             Dictionary<string, int> featuresByLayer,
             int                     tessSegs,
-            int                     srid)
+            int                     srid,
+            string?                 centerlineLayerName = null)
         {
             // LwPolyline ─── 2D polyline with optional bulge per vertex
-            Dispatch(dxfDoc.LwPolylines,  e => MapLwPolyline(e, tessSegs),  features, warnings, featuresByLayer);
+            Dispatch(FilterByLayer(dxfDoc.LwPolylines, centerlineLayerName), e => MapLwPolyline(e, tessSegs), features, warnings, featuresByLayer, centerlineLayerName);
             // Polyline ────── 3D legacy polyline
-            Dispatch(dxfDoc.Polylines,    e => MapPolyline(e),              features, warnings, featuresByLayer);
+            Dispatch(FilterByLayer(dxfDoc.Polylines, centerlineLayerName),   e => MapPolyline(e),             features, warnings, featuresByLayer, centerlineLayerName);
             // Line ──────────── simple two-point segment
-            Dispatch(dxfDoc.Lines,        e => MapLine(e),                  features, warnings, featuresByLayer);
+            Dispatch(FilterByLayer(dxfDoc.Lines, centerlineLayerName),       e => MapLine(e),                 features, warnings, featuresByLayer, centerlineLayerName);
             // Arc ─────────── circular arc
-            Dispatch(dxfDoc.Arcs,         e => MapArc(e, tessSegs),         features, warnings, featuresByLayer);
+            Dispatch(FilterByLayer(dxfDoc.Arcs, centerlineLayerName),        e => MapArc(e, tessSegs),        features, warnings, featuresByLayer, centerlineLayerName);
             // Circle ─────── full circle → closed polygon ring
-            Dispatch(dxfDoc.Circles,      e => MapCircle(e, tessSegs),      features, warnings, featuresByLayer);
-            Dispatch(dxfDoc.Splines,      e => MapSpline(e, tessSegs),      features, warnings, featuresByLayer);
+            Dispatch(FilterByLayer(dxfDoc.Circles, centerlineLayerName),     e => MapCircle(e, tessSegs),     features, warnings, featuresByLayer, centerlineLayerName);
+            Dispatch(FilterByLayer(dxfDoc.Splines, centerlineLayerName),     e => MapSpline(e, tessSegs),     features, warnings, featuresByLayer, centerlineLayerName);
             // Point ──────── single coordinate
-            Dispatch(dxfDoc.Points,       e => MapPoint(e),                 features, warnings, featuresByLayer);
+            Dispatch(FilterByLayer(dxfDoc.Points, centerlineLayerName),      e => MapPoint(e),                features, warnings, featuresByLayer, centerlineLayerName);
             // Hatch ──────── filled region bounded by edges
-            Dispatch(dxfDoc.Hatches,      e => MapHatch(e, tessSegs),       features, warnings, featuresByLayer);
+            Dispatch(FilterByLayer(dxfDoc.Hatches, centerlineLayerName),     e => MapHatch(e, tessSegs),      features, warnings, featuresByLayer, centerlineLayerName);
         }
 
         /// <summary>
@@ -270,7 +343,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             Func<TEntity, IGeometryObject?>       converter,
             List<Feature>                         features,
             List<string>                          warnings,
-            Dictionary<string, int>              featuresByLayer)
+            Dictionary<string, int>              featuresByLayer,
+            string?                               centerlineLayerName = null)
             where TEntity : EntityObject
         {
             if (entities is null) return;
@@ -282,7 +356,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                     var geometry = converter(entity);
                     if (geometry is null) continue;
 
-                    var props   = BuildProperties(entity);
+                    var props   = BuildProperties(entity, centerlineLayerName);
                     features.Add(new Feature(geometry, props));
 
                     var layerName = entity.Layer?.Name ?? "0";
@@ -611,7 +685,7 @@ namespace RoadGuard.CadParser.Services.Implementations
         /// Builds the GeoJSON Feature Properties dictionary from entity and layer metadata.
         /// No layer names are hardcoded; all metadata is derived dynamically.
         /// </summary>
-        private static Dictionary<string, object?> BuildProperties(EntityObject entity)
+        private static Dictionary<string, object?> BuildProperties(EntityObject entity, string? centerlineLayerName = null)
         {
             var layer = entity.Layer ?? Layer.Default;
 
@@ -626,8 +700,8 @@ namespace RoadGuard.CadParser.Services.Implementations
 
             return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
             {
-                // UI layer classification
-                ["layerType"]        = DetermineLayerType(entity),
+                // UI layer classification (dynamically maps selected layer to Centerline)
+                ["layerType"]        = DetermineLayerType(entity, centerlineLayerName),
 
                 // Z-Axis elevation metadata (Step 1)
                 ["averageElevation"] = Math.Round(elevation, 3),
@@ -655,6 +729,72 @@ namespace RoadGuard.CadParser.Services.Implementations
         // ================================================================== //
         //  Private — Validation                                               //
         // ================================================================== //
+
+                /// <summary>
+        /// Resilient DXF loader. Many real-world DXF files contain TextStyle font names without
+        /// .ttf/.shx extension (e.g. 'txt', 'vntime'), causing netDxf 2.1.1 to throw an ArgumentException
+        /// and return null. This helper sanitizes font definitions in memory before giving up.
+        /// </summary>
+        private DxfDocument? LoadDxfDocument(Stream stream, string fileName)
+        {
+            stream.Position = 0;
+            DxfDocument? doc = null;
+            try
+            {
+                doc = DxfDocument.Load(stream);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Initial DxfDocument.Load threw exception for '{FileName}'. Attempting sanitization.", fileName);
+            }
+
+            if (doc is not null) return doc;
+
+            // Fallback: sanitize TextStyle entries in ASCII DXF
+            try
+            {
+                stream.Position = 0;
+                using var reader = new StreamReader(stream, System.Text.Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
+                var sb = new System.Text.StringBuilder();
+                string? prevLine = null;
+                bool inStyleTable = false;
+
+                string? line;
+                while ((line = reader.ReadLine()) is not null)
+                {
+                    string trimmed = line.Trim();
+                    if (trimmed == "STYLE") inStyleTable = true;
+                    else if (trimmed == "ENDTAB") inStyleTable = false;
+
+                    // Group code 3 in STYLE table specifies the font file name
+                    if (inStyleTable && prevLine?.Trim() == "3" && !string.IsNullOrWhiteSpace(trimmed))
+                    {
+                        if (!trimmed.EndsWith(".ttf", StringComparison.OrdinalIgnoreCase) &&
+                            !trimmed.EndsWith(".shx", StringComparison.OrdinalIgnoreCase))
+                        {
+                            line = trimmed + ".ttf";
+                        }
+                    }
+
+                    sb.AppendLine(line);
+                    prevLine = line;
+                }
+
+                var sanitizedBytes = System.Text.Encoding.UTF8.GetBytes(sb.ToString());
+                using var sanitizedStream = new MemoryStream(sanitizedBytes);
+                doc = DxfDocument.Load(sanitizedStream);
+                if (doc is not null)
+                {
+                    _logger.LogInformation("Successfully loaded '{FileName}' after font sanitization.", fileName);
+                }
+                return doc;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Sanitization fallback failed for '{FileName}'.", fileName);
+                return null;
+            }
+        }
 
         private static void ValidateFile(IFormFile file)
         {
@@ -734,7 +874,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             List<Feature> features,
             Dictionary<string, int> featuresByLayer,
             double segmentLength,
-            int srid)
+            int srid,
+            string? centerlineLayerName = null)
         {
             var stationFeatures = new List<Feature>();
             var ntsFactory = new NtsGeometryFactory(new NtsPrecisionModel(), srid);
@@ -826,15 +967,27 @@ namespace RoadGuard.CadParser.Services.Implementations
             return stationFeatures;
         }
 
-        private static string DetermineLayerType(EntityObject entity)
+        private static string DetermineLayerType(EntityObject entity, string? centerlineLayerName = null)
         {
-            var layerName = entity.Layer?.Name?.ToUpperInvariant() ?? string.Empty;
+            var rawLayerName = entity.Layer?.Name ?? string.Empty;
+
+            // If caller explicitly selected a centerline layer, map that layer to Centerline
+            if (!string.IsNullOrWhiteSpace(centerlineLayerName) &&
+                string.Equals(rawLayerName, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+            {
+                return "Centerline";
+            }
+
+            var layerName = rawLayerName.ToUpperInvariant();
             if (layerName.Contains("EDGE") || layerName.Contains("BIEN") || layerName.Contains("LE"))
                 return "Edges";
             if (layerName.Contains("BOUND") || layerName.Contains("RANH") || layerName.Contains("GIOI"))
                 return "Boundaries";
             if (layerName.Contains("SURFACE") || layerName.Contains("MAT"))
                 return "RoadSurface";
+            if (layerName.Contains("TIM") || layerName.Contains("CENTER"))
+                return "Centerline";
+
             return "Centerline";
         }
 
@@ -842,7 +995,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             List<Feature> features,
             Dictionary<string, int> featuresByLayer,
             double roadWidth,
-            int srid)
+            int srid,
+            string? centerlineLayerName = null)
         {
             if (roadWidth <= 0) return;
 
