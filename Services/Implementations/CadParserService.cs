@@ -95,43 +95,72 @@ namespace RoadGuard.CadParser.Services.Implementations
         {
             ValidateFile(file);
 
-            using var stream = new MemoryStream();
-            await file.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
-            stream.Position = 0;
-
-            return await Task.Run(() =>
+            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var dxfDoc = LoadDxfDocument(stream, file.FileName);
-
-                if (dxfDoc is null)
+                await using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
-                    throw new InvalidOperationException(
-                        $"DxfDocument.Load returned null for '{file.FileName}'. The file may be empty or corrupted.");
+                    await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
                 }
 
-                var layerNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                // Collect from Layers table
-                foreach (var layer in dxfDoc.Layers)
+                try
                 {
-                    if (!string.IsNullOrWhiteSpace(layer.Name))
-                        layerNames.Add(layer.Name);
+                    var json = await RunPythonBridgeAsync($"get-layers \"{tempFile}\"", cancellationToken).ConfigureAwait(false);
+                    var pyRes = Newtonsoft.Json.JsonConvert.DeserializeObject<PythonLayersResult>(json);
+                    if (pyRes is not null && pyRes.Success && pyRes.Layers.Count > 0)
+                    {
+                        return pyRes.Layers;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Python bridge get-layers failed; falling back to netDxf.");
                 }
 
-                // Collect from graphic entities
-                foreach (var e in dxfDoc.LwPolylines) if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
-                foreach (var e in dxfDoc.Polylines)   if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
-                foreach (var e in dxfDoc.Lines)       if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
-                foreach (var e in dxfDoc.Arcs)        if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
-                foreach (var e in dxfDoc.Circles)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
-                foreach (var e in dxfDoc.Splines)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
-                foreach (var e in dxfDoc.Points)      if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
-                foreach (var e in dxfDoc.Hatches)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                // Fallback to netDxf
+                using var stream = new MemoryStream();
+                await using (var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    await fs.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
+                }
+                stream.Position = 0;
 
-                return layerNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
-            }, cancellationToken).ConfigureAwait(false);
+                return await Task.Run(() =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var dxfDoc = LoadDxfDocument(stream, file.FileName);
+                    if (dxfDoc is null)
+                    {
+                        throw new InvalidOperationException(
+                            $"DxfDocument.Load returned null for '{file.FileName}'. The file may be empty or corrupted.");
+                    }
+
+                    var layerNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var layer in dxfDoc.Layers)
+                    {
+                        if (!string.IsNullOrWhiteSpace(layer.Name))
+                            layerNames.Add(layer.Name);
+                    }
+                    foreach (var e in dxfDoc.LwPolylines) if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                    foreach (var e in dxfDoc.Polylines)   if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                    foreach (var e in dxfDoc.Lines)       if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                    foreach (var e in dxfDoc.Arcs)        if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                    foreach (var e in dxfDoc.Circles)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                    foreach (var e in dxfDoc.Splines)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                    foreach (var e in dxfDoc.Points)      if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+                    foreach (var e in dxfDoc.Hatches)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
+
+                    return layerNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+                }, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                {
+                    try { File.Delete(tempFile); } catch { }
+                }
+            }
         }
 
         /// <inheritdoc/>
@@ -145,7 +174,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             string? centerlineLayerName = null,
             CancellationToken cancellationToken = default)
         {
-            // ── 1. Validate inputs ───────────────────────────────────────── //
+            // ?? 1. Validate inputs ????????????????????????????????????????? //
             ValidateFile(file);
             ValidateSrid(srid);
             tessellationSegments = Math.Max(MinTessellationSegs, tessellationSegments);
@@ -156,141 +185,367 @@ namespace RoadGuard.CadParser.Services.Implementations
             var stopwatch = Stopwatch.StartNew();
 
             _logger.LogInformation(
-                "Starting DXF parse: file={FileName}, size={Size}B, srid={Srid}, tessSegs={Segs}",
-                file.FileName, file.Length, srid, tessellationSegments);
+                "Starting DXF parse: file={FileName}, size={Size}B, srid={Srid}, tessSegs={Segs}, layer={Layer}",
+                file.FileName, file.Length, srid, tessellationSegments, centerlineLayerName ?? "(auto-detect)");
 
-            // ── 2. Buffer IFormFile entirely in-memory (no temp file writes) //
-            using var stream = new MemoryStream();
-            await file.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
-            stream.Position = 0;
-
-            // 3. Offload CPU-bound DXF parsing, tessellation, stationing, and analytics to thread pool
-            var (features, warnings, featuresByLayer, analytics) = await Task.Run(() =>
+            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                var dxfDoc = LoadDxfDocument(stream, file.FileName);
-
-                if (dxfDoc is null)
-                    throw new InvalidOperationException(
-                        $"DxfDocument.Load returned null for '{file.FileName}'. The file may be empty or corrupted.");
-
-                cancellationToken.ThrowIfCancellationRequested();
-
-                // Dynamic layer validation: if centerlineLayerName is provided, verify presence and valid geometries
-                if (!string.IsNullOrWhiteSpace(centerlineLayerName))
+                await using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
-                    bool layerExists = dxfDoc.Layers.Any(l => string.Equals(l.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
-                        || dxfDoc.LwPolylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
-                        || dxfDoc.Polylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
-                        || dxfDoc.Lines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
-                        || dxfDoc.Splines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
-                        || dxfDoc.Arcs.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase));
-
-                    if (!layerExists)
-                    {
-                        throw new InvalidOperationException(
-                            $"Layer '{centerlineLayerName}' was not found in the DXF file. Please select a valid layer from the file.");
-                    }
-
-                    bool hasLinearGeometries =
-                        dxfDoc.LwPolylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase) && e.Vertexes.Count >= 2) ||
-                        dxfDoc.Polylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase) && e.Vertexes.Count >= 2) ||
-                        dxfDoc.Lines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase)) ||
-                        dxfDoc.Splines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase)) ||
-                        dxfDoc.Arcs.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase));
-
-                    if (!hasLinearGeometries)
-                    {
-                        throw new InvalidOperationException(
-                            $"The selected layer '{centerlineLayerName}' contains no valid polylines or lines to represent the road centerline.");
-                    }
+                    await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
                 }
 
-                var feats   = new List<Feature>();
-                var warns   = new List<string>();
-                var byLayer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-                // Step 3: Complex entities (Arc, Spline, Polyline with bulges)
-                ProcessAllEntities(dxfDoc, feats, warns, byLayer, tessellationSegments, srid, centerlineLayerName);
-
-                // Step 2: Physical stationing points via Linear Referencing
-                var stations = GenerateStationPoints(feats, byLayer, segmentLength, srid, centerlineLayerName);
-
-                // Step 4 Bonus: Generate RoadSurface buffer polygon for Centerline features
-                GenerateRoadSurfaceBuffers(feats, byLayer, roadWidth, srid, centerlineLayerName);
-
-                // Analytics calculation
-                stopwatch.Stop();
-                double rawLen = 0.0;
-                foreach (var feat in feats)
+                // ?? Try Python Bridge first for heavy & modern CAD ingestion ? //
+                PythonParseResult? pyParseResult = null;
+                try
                 {
-                    if (feat.Properties.TryGetValue("isGeneratedBuffer", out var isGen) && isGen is true)
-                        continue;
-                    if (feat.Properties.TryGetValue("layerType", out var lt) &&
-                        lt is string sLt && string.Equals(sLt, "StationPoint", StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    switch (feat.Geometry)
+                    var bridgeArgs = $"parse \"{tempFile}\" --srid {srid}";
+                    if (!string.IsNullOrWhiteSpace(centerlineLayerName))
                     {
-                        case GjsLineStr ls:
-                            var lsCoords = ls.Coordinates;
-                            for (int i = 1; i < lsCoords.Count; i++)
+                        bridgeArgs += $" --layer \"{centerlineLayerName}\"";
+                    }
+
+                    var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+                    pyParseResult = Newtonsoft.Json.JsonConvert.DeserializeObject<PythonParseResult>(json);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Python bridge parse failed or threw exception; attempting netDxf fallback.");
+                }
+
+                if (pyParseResult is not null)
+                {
+                    if (!pyParseResult.Success)
+                    {
+                        throw new InvalidOperationException(
+                            pyParseResult.Detail ?? pyParseResult.Error ?? "CAD parsing failed in Python bridge.");
+                    }
+
+                    var chosenCenterlineLayer = pyParseResult.DetectedLayer ?? centerlineLayerName ?? "ROAD_CENTERLINE";
+                    var feats = new List<Feature>();
+                    var warns = new List<string>();
+                    var byLayer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var item in pyParseResult.Features)
+                    {
+                        if (item.Coordinates == null || item.Coordinates.Count < 2) continue;
+
+                        var coords = new List<NtsCoordinate>();
+                        foreach (var pt in item.Coordinates)
+                        {
+                            if (pt.Count >= 2)
                             {
-                                double dx = lsCoords[i].Longitude - lsCoords[i - 1].Longitude;
-                                double dy = lsCoords[i].Latitude  - lsCoords[i - 1].Latitude;
-                                rawLen += Math.Sqrt(dx * dx + dy * dy);
+                                double x = pt[0];
+                                double y = pt[1];
+                                double z = pt.Count >= 3 ? pt[2] : item.Elevation;
+                                coords.Add(new CoordinateZ(x, y, z));
                             }
-                            break;
-                        case GjsPolygon poly:
-                            if (poly.Coordinates.Count > 0)
-                            {
-                                var ring = poly.Coordinates[0].Coordinates;
-                                for (int i = 1; i < ring.Count; i++)
+                        }
+
+                        if (coords.Count < 2) continue;
+
+                        var geom = ToGjsLineString(coords);
+                        var props = new Dictionary<string, object>
+                        {
+                            ["layer"] = chosenCenterlineLayer,
+                            ["layerName"] = chosenCenterlineLayer,
+                            ["layerType"] = "Centerline",
+                            ["elevation"] = item.Elevation
+                        };
+
+                        feats.Add(new Feature(geom, props));
+                        byLayer[chosenCenterlineLayer] = byLayer.TryGetValue(chosenCenterlineLayer, out var c) ? c + 1 : 1;
+                    }
+
+                    if (feats.Count == 0)
+                    {
+                        throw new InvalidOperationException(
+                            $"No valid linear entities found on detected layer '{chosenCenterlineLayer}' to represent the road centerline.");
+                    }
+
+                    // Physical stationing points via Linear Referencing
+                    var stations = GenerateStationPoints(feats, byLayer, segmentLength, srid, chosenCenterlineLayer);
+
+                    // Generate RoadSurface buffer polygon
+                    GenerateRoadSurfaceBuffers(feats, byLayer, roadWidth, srid, chosenCenterlineLayer);
+
+                    // Analytics calculation
+                    stopwatch.Stop();
+                    double rawLen = 0.0;
+                    foreach (var feat in feats)
+                    {
+                        if (feat.Properties.TryGetValue("isGeneratedBuffer", out var isGen) && isGen is true)
+                            continue;
+                        if (feat.Properties.TryGetValue("layerType", out var lt) &&
+                            lt is string sLt && string.Equals(sLt, "StationPoint", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        switch (feat.Geometry)
+                        {
+                            case GjsLineStr ls:
+                                var lsCoords = ls.Coordinates;
+                                for (int i = 1; i < lsCoords.Count; i++)
                                 {
-                                    double dx = ring[i].Longitude - ring[i - 1].Longitude;
-                                    double dy = ring[i].Latitude  - ring[i - 1].Latitude;
+                                    double dx = lsCoords[i].Longitude - lsCoords[i - 1].Longitude;
+                                    double dy = lsCoords[i].Latitude  - lsCoords[i - 1].Latitude;
                                     rawLen += Math.Sqrt(dx * dx + dy * dy);
                                 }
-                            }
-                            break;
+                                break;
+                            case GjsPolygon poly:
+                                if (poly.Coordinates.Count > 0)
+                                {
+                                    var ring = poly.Coordinates[0].Coordinates;
+                                    for (int i = 1; i < ring.Count; i++)
+                                    {
+                                        double dx = ring[i].Longitude - ring[i - 1].Longitude;
+                                        double dy = ring[i].Latitude  - ring[i - 1].Latitude;
+                                        rawLen += Math.Sqrt(dx * dx + dy * dy);
+                                    }
+                                }
+                                break;
+                        }
                     }
+
+                    double totalMeters  = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
+                    double totalAreaSqm = Math.Round(totalMeters * roadWidth, 2);
+                    int estimatedSlabs  = (int)Math.Ceiling(totalMeters / slabLength);
+                    int roadSegments    = stations.Count > 0 ? stations.Count : (int)Math.Ceiling(totalMeters / segmentLength);
+
+                    var engAnalytics = new EngineeringAnalytics
+                    {
+                        TotalLengthMeters      = Math.Round(totalMeters, 3),
+                        TotalAreaSqm           = totalAreaSqm,
+                        EstimatedConcreteSlabs = estimatedSlabs,
+                        RoadSegments           = roadSegments,
+                        ProcessingTimeMs       = stopwatch.ElapsedMilliseconds
+                    };
+
+                    _logger.LogInformation(
+                        "Python bridge parse complete: {Count} features, layer='{Layer}', {Elapsed}ms.",
+                        feats.Count, chosenCenterlineLayer, stopwatch.ElapsedMilliseconds);
+
+                    await PersistToDatabaseAsync(file.FileName, srid, feats, cancellationToken).ConfigureAwait(false);
+
+                    return new GeoJsonResponse
+                    {
+                        SourceFileName      = file.FileName,
+                        Srid                = srid,
+                        TotalFeatureCount   = feats.Count,
+                        FeatureCountByLayer = byLayer,
+                        FeatureCollection   = new FeatureCollection(feats),
+                        Warnings            = warns,
+                        Analytics           = engAnalytics
+                    };
                 }
 
-                double totalMeters  = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
-                double totalAreaSqm = Math.Round(totalMeters * roadWidth, 2);
-                int estimatedSlabs  = (int)Math.Ceiling(totalMeters / slabLength);
-                int roadSegments    = stations.Count > 0 ? stations.Count : (int)Math.Ceiling(totalMeters / segmentLength);
-
-                var engAnalytics = new EngineeringAnalytics
+                // ?? Fallback to legacy netDxf parsing ????????????????????????? //
+                using var stream = new MemoryStream();
+                await using (var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read))
                 {
-                    TotalLengthMeters      = Math.Round(totalMeters, 3),
-                    TotalAreaSqm           = totalAreaSqm,
-                    EstimatedConcreteSlabs = estimatedSlabs,
-                    RoadSegments           = roadSegments,
-                    ProcessingTimeMs       = stopwatch.ElapsedMilliseconds
+                    await fs.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
+                }
+                stream.Position = 0;
+
+                var (features, warnings, featuresByLayer, analytics) = await Task.Run(() =>
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var dxfDoc = LoadDxfDocument(stream, file.FileName);
+                    if (dxfDoc is null)
+                        throw new InvalidOperationException(
+                            $"DxfDocument.Load returned null for '{file.FileName}'. The file may be empty or corrupted.");
+
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // Dynamic layer validation: if centerlineLayerName is provided, verify presence and valid geometries
+                    if (!string.IsNullOrWhiteSpace(centerlineLayerName))
+                    {
+                        bool layerExists = dxfDoc.Layers.Any(l => string.Equals(l.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                            || dxfDoc.LwPolylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                            || dxfDoc.Polylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                            || dxfDoc.Lines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                            || dxfDoc.Splines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase))
+                            || dxfDoc.Arcs.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase));
+
+                        if (!layerExists)
+                        {
+                            throw new InvalidOperationException(
+                                $"Layer '{centerlineLayerName}' was not found in the DXF file. Please select a valid layer from the file.");
+                        }
+
+                        bool hasLinearGeometries =
+                            dxfDoc.LwPolylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase) && e.Vertexes.Count >= 2) ||
+                            dxfDoc.Polylines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase) && e.Vertexes.Count >= 2) ||
+                            dxfDoc.Lines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase)) ||
+                            dxfDoc.Splines.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase)) ||
+                            dxfDoc.Arcs.Any(e => string.Equals(e.Layer?.Name, centerlineLayerName, StringComparison.OrdinalIgnoreCase));
+
+                        if (!hasLinearGeometries)
+                        {
+                            throw new InvalidOperationException(
+                                $"The selected layer '{centerlineLayerName}' contains no valid polylines or lines to represent the road centerline.");
+                        }
+                    }
+
+                    var feats   = new List<Feature>();
+                    var warns   = new List<string>();
+                    var byLayer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+                    // Step 3: Complex entities (Arc, Spline, Polyline with bulges)
+                    ProcessAllEntities(dxfDoc, feats, warns, byLayer, tessellationSegments, srid, centerlineLayerName);
+
+                    // Step 2: Physical stationing points via Linear Referencing
+                    var stations = GenerateStationPoints(feats, byLayer, segmentLength, srid, centerlineLayerName);
+
+                    // Step 4 Bonus: Generate RoadSurface buffer polygon for Centerline features
+                    GenerateRoadSurfaceBuffers(feats, byLayer, roadWidth, srid, centerlineLayerName);
+
+                    // Analytics calculation
+                    stopwatch.Stop();
+                    double rawLen = 0.0;
+                    foreach (var feat in feats)
+                    {
+                        if (feat.Properties.TryGetValue("isGeneratedBuffer", out var isGen) && isGen is true)
+                            continue;
+                        if (feat.Properties.TryGetValue("layerType", out var lt) &&
+                            lt is string sLt && string.Equals(sLt, "StationPoint", StringComparison.OrdinalIgnoreCase))
+                            continue;
+
+                        switch (feat.Geometry)
+                        {
+                            case GjsLineStr ls:
+                                var lsCoords = ls.Coordinates;
+                                for (int i = 1; i < lsCoords.Count; i++)
+                                {
+                                    double dx = lsCoords[i].Longitude - lsCoords[i - 1].Longitude;
+                                    double dy = lsCoords[i].Latitude  - lsCoords[i - 1].Latitude;
+                                    rawLen += Math.Sqrt(dx * dx + dy * dy);
+                                }
+                                break;
+                            case GjsPolygon poly:
+                                if (poly.Coordinates.Count > 0)
+                                {
+                                    var ring = poly.Coordinates[0].Coordinates;
+                                    for (int i = 1; i < ring.Count; i++)
+                                    {
+                                        double dx = ring[i].Longitude - ring[i - 1].Longitude;
+                                        double dy = ring[i].Latitude  - ring[i - 1].Latitude;
+                                        rawLen += Math.Sqrt(dx * dx + dy * dy);
+                                    }
+                                }
+                                break;
+                        }
+                    }
+
+                    double totalMeters  = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
+                    double totalAreaSqm = Math.Round(totalMeters * roadWidth, 2);
+                    int estimatedSlabs  = (int)Math.Ceiling(totalMeters / slabLength);
+                    int roadSegments    = stations.Count > 0 ? stations.Count : (int)Math.Ceiling(totalMeters / segmentLength);
+
+                    var engAnalytics = new EngineeringAnalytics
+                    {
+                        TotalLengthMeters      = Math.Round(totalMeters, 3),
+                        TotalAreaSqm           = totalAreaSqm,
+                        EstimatedConcreteSlabs = estimatedSlabs,
+                        RoadSegments           = roadSegments,
+                        ProcessingTimeMs       = stopwatch.ElapsedMilliseconds
+                    };
+
+                    return (feats, warns, byLayer, engAnalytics);
+                }, cancellationToken).ConfigureAwait(false);
+
+                _logger.LogInformation(
+                    "netDxf fallback complete: {Count} features, {Layers} layer(s), {Warns} warning(s).",
+                    features.Count, featuresByLayer.Count, warnings.Count);
+
+                await PersistToDatabaseAsync(file.FileName, srid, features, cancellationToken).ConfigureAwait(false);
+
+                return new GeoJsonResponse
+                {
+                    SourceFileName      = file.FileName,
+                    Srid                = srid,
+                    TotalFeatureCount   = features.Count,
+                    FeatureCountByLayer = featuresByLayer,
+                    FeatureCollection   = new FeatureCollection(features),
+                    Warnings            = warnings,
+                    Analytics           = analytics
                 };
-
-                return (feats, warns, byLayer, engAnalytics);
-            }, cancellationToken).ConfigureAwait(false);
-
-            _logger.LogInformation(
-                "Parse complete: {Count} features, {Layers} layer(s), {Warns} warning(s).",
-                features.Count, featuresByLayer.Count, warnings.Count);
-
-            // Step 5: Database Persistence
-            await PersistToDatabaseAsync(file.FileName, srid, features, cancellationToken).ConfigureAwait(false);
-
-            return new GeoJsonResponse
+            }
+            finally
             {
-                SourceFileName      = file.FileName,
-                Srid                = srid,
-                TotalFeatureCount   = features.Count,
-                FeatureCountByLayer = featuresByLayer,
-                FeatureCollection   = new FeatureCollection(features),
-                Warnings            = warnings,
-                Analytics           = analytics
+                if (File.Exists(tempFile))
+                {
+                    try { File.Delete(tempFile); } catch { }
+                }
+            }
+        }
+
+        private async Task<string> RunPythonBridgeAsync(string arguments, CancellationToken cancellationToken)
+        {
+            var scriptPath = Path.Combine(AppContext.BaseDirectory, "Services", "PythonBridge", "cad_bridge.py");
+            if (!File.Exists(scriptPath))
+            {
+                scriptPath = Path.Combine(Directory.GetCurrentDirectory(), "Services", "PythonBridge", "cad_bridge.py");
+            }
+
+            if (!File.Exists(scriptPath))
+            {
+                throw new FileNotFoundException($"Python bridge script not found at '{scriptPath}'.");
+            }
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "python",
+                Arguments = $"\"{scriptPath}\" {arguments}",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
             };
+
+            using var process = new Process { StartInfo = startInfo };
+            process.Start();
+
+            var outputTask = process.StandardOutput.ReadToEndAsync();
+            var errorTask = process.StandardError.ReadToEndAsync();
+
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            var output = await outputTask.ConfigureAwait(false);
+            var error = await errorTask.ConfigureAwait(false);
+
+            if (process.ExitCode != 0 && string.IsNullOrWhiteSpace(output))
+            {
+                throw new InvalidOperationException($"Python bridge failed: {error}");
+            }
+
+            return output;
+        }
+
+        private sealed class PythonLayersResult
+        {
+            public bool Success { get; set; }
+            public List<string> Layers { get; set; } = new();
+            public string? Error { get; set; }
+            public string? Detail { get; set; }
+        }
+
+        private sealed class PythonFeatureData
+        {
+            public string Layer { get; set; } = string.Empty;
+            public double Elevation { get; set; }
+            public List<List<double>> Coordinates { get; set; } = new();
+        }
+
+        private sealed class PythonParseResult
+        {
+            public bool Success { get; set; }
+            public string? DetectedLayer { get; set; }
+            public int TotalEntities { get; set; }
+            public List<string> Layers { get; set; } = new();
+            public List<PythonFeatureData> Features { get; set; } = new();
+            public string? Error { get; set; }
+            public string? Detail { get; set; }
         }
 
         // ================================================================== //
