@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using Microsoft.AspNetCore.Http;
 using Newtonsoft.Json;
 using System.Text.Json.Serialization;
+using GeoJSON.Net.Feature;
 
 namespace RoadGuard.CadParser.DTOs
 {
@@ -15,6 +16,18 @@ namespace RoadGuard.CadParser.DTOs
 
     public sealed class CadRenderOverlayResponse
     {
+        [JsonProperty("bounds")]
+        [JsonPropertyName("bounds")]
+        public List<List<double>> Bounds { get; set; } = new();
+
+        [JsonProperty("image_base64")]
+        [JsonPropertyName("imageBase64")]
+        public string ImageBase64 { get; set; } = string.Empty;
+
+        [JsonProperty("geojson")]
+        [JsonPropertyName("geojson")]
+        public FeatureCollection? GeoJson { get; set; }
+
         [JsonProperty("success")]
         [JsonPropertyName("success")]
         public bool Success { get; set; }
@@ -27,10 +40,6 @@ namespace RoadGuard.CadParser.DTOs
         [JsonPropertyName("croppedToLayer")]
         public string? CroppedToLayer { get; set; }
 
-        [JsonProperty("bounds")]
-        [JsonPropertyName("bounds")]
-        public List<List<double>> Bounds { get; set; } = new();
-
         [JsonProperty("bbox_wgs84")]
         [JsonPropertyName("bboxWgs84")]
         public Dictionary<string, double>? BboxWgs84 { get; set; }
@@ -38,10 +47,6 @@ namespace RoadGuard.CadParser.DTOs
         [JsonProperty("bbox_wcs")]
         [JsonPropertyName("bboxWcs")]
         public List<double>? BboxWcs { get; set; }
-
-        [JsonProperty("image_base64")]
-        [JsonPropertyName("imageBase64")]
-        public string ImageBase64 { get; set; } = string.Empty;
 
         [JsonProperty("image_size_px")]
         [JsonPropertyName("imageSizePx")]

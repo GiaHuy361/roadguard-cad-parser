@@ -522,6 +522,89 @@ def bbox_to_wgs84_leaflet(min_x, min_y, max_x, max_y):
     }
 
 
+
+# =============================================================================
+# Extract Corridor Vector Geometries (GeoJSON FeatureCollection)
+# =============================================================================
+
+CORRIDOR_KEYWORDS = [
+    "TIM", "TUYEN", "CENTER", "MEP", "BO_VIA", "BOVIA",
+    "LE_", "LEDUONG", "VACH", "RANH", "VAI", "PHANCACH"
+]
+
+def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
+    """
+    Extracts key vector features (Centerline, Edges, Curbs, Shoulders, Markings)
+    located within the road corridor bounding box.
+    Tessellates all curved segments (bulges and arcs) into smooth coordinate chains
+    and projects them to WGS-84 [lon, lat] (or target srid).
+    Returns an RFC 7946 FeatureCollection dictionary.
+    """
+    min_x, min_y, max_x, max_y = corridor_bbox
+    features = []
+    seg_counts = {}
+
+    for entity, xform in walk_entities(msp, doc):
+        if entity.dxftype() not in LINEAR_TYPES:
+            continue
+        lyr = entity.dxf.get("layer", "")
+        upper = lyr.upper()
+        if any(ex in upper for ex in EXCLUDE_KEYWORDS):
+            continue
+        if (chosen_layer and lyr.upper() != chosen_layer.upper()) and not any(k in upper for k in CORRIDOR_KEYWORDS):
+            continue
+
+        pts = entity_to_wcs_points(entity, xform)
+        if not pts or len(pts) < 2:
+            continue
+
+        # Spatial filter: at least one vertex must be inside the road corridor bbox
+        if not any(min_x <= p[0] <= max_x and min_y <= p[1] <= max_y for p in pts):
+            continue
+
+        projected = project_to_wgs84(pts) if srid == 4326 else project_points(pts, srid)
+        if len(projected) < 2:
+            continue
+
+        if (chosen_layer and lyr.upper() == chosen_layer.upper()) or any(k in upper for k in ["TIM", "CENTER", "TUYEN"]):
+            feat_type, prefix = "Centerline", "CL"
+        elif any(k in upper for k in ["MEP"]):
+            feat_type, prefix = "RoadEdge", "EDGE"
+        elif any(k in upper for k in ["BO_VIA", "BOVIA"]):
+            feat_type, prefix = "Curb", "CURB"
+        elif any(k in upper for k in ["LE", "VAI"]):
+            feat_type, prefix = "Shoulder", "SHLD"
+        elif any(k in upper for k in ["VACH", "SON"]):
+            feat_type, prefix = "Marking", "MRK"
+        else:
+            feat_type, prefix = "CorridorLine", "SEG"
+
+        seg_counts[prefix] = seg_counts.get(prefix, 0) + 1
+        elev = 0.0
+        try:
+            elev = float(entity.dxf.get("elevation", 0.0))
+        except Exception:
+            pass
+
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "layer": lyr,
+                "type": feat_type,
+                "segment": f"{prefix}-{seg_counts[prefix]:03d}",
+                "elevation": elev
+            },
+            "geometry": {
+                "type": "LineString",
+                "coordinates": projected
+            }
+        })
+
+    return {
+        "type": "FeatureCollection",
+        "features": features
+    }
+
 def render_dxf_to_png(
     dxf_path_str: str,
     output_size_px: int = 4096,
@@ -692,21 +775,28 @@ def render_dxf_to_png(
         int(round(fig_w_in * dpi)),
         int(round(fig_h_in * dpi))
     ]
+    # Extract tessellated vector corridor GeoJSON features
+    corridor_geojson = extract_corridor_geojson(
+        msp, doc, chosen_layer,
+        (crop_min_x, crop_min_y, crop_max_x, crop_max_y)
+    )
+
     return {
+        "bounds": [
+            [wgs84["south"], wgs84["west"]],
+            [wgs84["north"], wgs84["east"]]
+        ],
+        "image_base64": b64,
+        "geojson": corridor_geojson,
         "success": True,
         "style": "concrete_road",
         "bbox_source": bbox_source,
         "cropped_to_layer": chosen_layer,
         "croppedToLayer": chosen_layer,
-        "bounds": [
-            [wgs84["south"], wgs84["west"]],
-            [wgs84["north"], wgs84["east"]]
-        ],
         "bbox_wgs84": wgs84,
         "bboxWgs84": wgs84,
         "bbox_wcs": [crop_min_x, crop_min_y, crop_max_x, crop_max_y],
         "bboxWcs": [crop_min_x, crop_min_y, crop_max_x, crop_max_y],
-        "image_base64": b64,
         "imageBase64": b64,
         "image_size_px": size_px,
         "imageSizePx": size_px
