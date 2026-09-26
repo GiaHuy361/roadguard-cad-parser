@@ -5,8 +5,37 @@ using GeoJSON.Net.Feature;
 namespace RoadGuard.CadParser.DTOs
 {
     /// <summary>
+    /// Engineering spatial analytics computed from the parsed geometry data.
+    /// Domain logic follows TCVN 10380:2014 (Vietnamese Road Engineering Standard).
+    /// </summary>
+    public sealed class EngineeringAnalytics
+    {
+        /// <summary>
+        /// Total length of all LineString / MultiLineString geometries in the drawing, in metres.
+        /// For SRID 4326 (degrees), raw degree-length is multiplied by 111,320 m/° (equatorial approximation).
+        /// For SRID 32648/32649 (UTM, metres), the raw NTS length is used directly.
+        /// </summary>
+        public double TotalLengthMeters { get; init; }
+
+        /// <summary>
+        /// Estimated number of concrete road slabs.
+        /// Formula (TCVN 10380:2014): TotalLengthMeters / 4.0 m per slab.
+        /// </summary>
+        public int EstimatedConcreteSlabs { get; init; }
+
+        /// <summary>
+        /// Number of 100-metre road segments inferred from total length.
+        /// Formula: ceil(TotalLengthMeters / 100.0).
+        /// </summary>
+        public int RoadSegments { get; init; }
+
+        /// <summary>Total wall-clock time spent parsing the DXF file, in milliseconds.</summary>
+        public long ProcessingTimeMs { get; init; }
+    }
+
+    /// <summary>
     /// Wraps the parsed GeoJSON FeatureCollection with additional metadata
-    /// about the source CAD file, SRID used, and parse statistics.
+    /// about the source CAD file, SRID used, parse statistics, and engineering analytics.
     /// </summary>
     public sealed class GeoJsonResponse
     {
@@ -42,6 +71,12 @@ namespace RoadGuard.CadParser.DTOs
         /// (e.g., unsupported entity types, degenerate geometries skipped).
         /// </summary>
         public List<string> Warnings { get; init; } = new();
+
+        /// <summary>
+        /// Spatial engineering analytics: total road length, slab count (TCVN 10380:2014),
+        /// segment count, and total processing time.
+        /// </summary>
+        public EngineeringAnalytics Analytics { get; init; } = new();
     }
 
     /// <summary>
