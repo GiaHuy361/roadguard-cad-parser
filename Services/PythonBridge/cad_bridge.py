@@ -710,40 +710,61 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
             "detail": f"No linear entities found in layer {chosen_layer}."
         }
 
-    # Merge primary lines to determine the primary corridor bounding box
-    primary_union = unary_union(primary_lines) if HAS_SHAPELY else None
-    if primary_union:
-        min_x, min_y, max_x, max_y = primary_union.bounds
-        min_x -= 60.0
-        max_x += 60.0
-        min_y -= 60.0
-        max_y += 60.0
-    else:
-        min_x, max_x = -1e9, 1e9
-        min_y, max_y = -1e9, 1e9
+    # 2. Extract connected primary corridor (discarding isolated draft splines like Ent 26 in the south)
+    if HAS_SHAPELY:
+        m = linemerge(primary_lines)
+        geoms = list(m.geoms) if hasattr(m, 'geoms') else [m]
+        main_cluster = [max(geoms, key=lambda g: g.length)]
+        remaining = [g for g in geoms if g is not main_cluster[0]]
+        changed = True
+        while changed:
+            changed = False
+            current_union = unary_union(main_cluster)
+            still_remaining = []
+            for g in remaining:
+                if current_union.distance(g) < 2.5:
+                    main_cluster.append(g)
+                    changed = True
+                else:
+                    still_remaining.append(g)
+            remaining = still_remaining
+        clean_main = unary_union(main_cluster)
 
-    # Collect connected candidate branches in the immediate corridor (e.g. top junction branches)
-    road_lines = list(primary_lines)
-    for e in msp:
-        lyr = e.dxf.layer.upper()
-        if any(k in lyr for k in ("DAUTIM", "TIMDUONGPHU", "TIMPHU", "TIM_PHU")):
-            pts = entity_to_wcs_points(e)
-            if pts and len(pts) >= 2:
-                fixed_pts = []
-                for p in pts:
-                    if (p[0] > 1_000_000.0 and p[1] < 900_000.0) or swap_xy:
-                        fixed_pts.append((p[1], p[0]))
-                    else:
-                        fixed_pts.append((p[0], p[1]))
-                if any(min_x <= p[0] <= max_x and min_y <= p[1] <= max_y for p in fixed_pts):
-                    for i in range(len(fixed_pts) - 1):
-                        if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > 0.01:
-                            road_lines.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
+        # 3. Collect connected candidate branches from junction layers (DAUTIM, TIMDUONGPHU, TIMPHU)
+        # Note: ONLY linear entities (LINE, LWPOLYLINE, ARC) - NEVER CIRCLE (avoids survey station markers)
+        branch_candidates = []
+        for e in msp:
+            lyr = e.dxf.layer.upper()
+            if e.dxftype() in ['LINE', 'LWPOLYLINE', 'ARC']:
+                if any(k in lyr for k in ("DAUTIM", "TIMDUONGPHU", "TIMPHU")):
+                    pts = entity_to_wcs_points(e)
+                    if pts and len(pts) >= 2:
+                        fixed_pts = []
+                        for p in pts:
+                            if (p[0] > 1_000_000.0 and p[1] < 900_000.0) or swap_xy:
+                                fixed_pts.append((p[1], p[0]))
+                            else:
+                                fixed_pts.append((p[0], p[1]))
+                        for i in range(len(fixed_pts) - 1):
+                            if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > 0.01:
+                                branch_candidates.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
 
-    # Use Shapely to form full corridor polygon and network
-    traffic_islands_geom = []
-    if HAS_SHAPELY and road_lines:
-        full_net = unary_union(road_lines)
+        full_cluster = list(main_cluster)
+        current_net = clean_main
+        changed = True
+        while changed:
+            changed = False
+            still_cands = []
+            for ls in branch_candidates:
+                if current_net.distance(ls) < 2.5:
+                    full_cluster.append(ls)
+                    current_net = unary_union(full_cluster)
+                    changed = True
+                else:
+                    still_cands.append(ls)
+            branch_candidates = still_cands
+
+        full_net = unary_union(full_cluster)
         buffered_poly = full_net.buffer(half_w, cap_style='flat', join_style='round')
         if buffered_poly.geom_type == 'MultiPolygon':
             poly_main = max(buffered_poly.geoms, key=lambda p: p.area)
@@ -755,7 +776,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
 
         cl_merged = linemerge(full_net) if full_net.geom_type == 'MultiLineString' else full_net
         if hasattr(cl_merged, 'geoms'):
-            branches_sorted = sorted(list(cl_merged.geoms), key=lambda g: g.length, reverse=True)
+            branches_sorted = sorted([g for g in cl_merged.geoms if g.length > 0.5], key=lambda g: g.length, reverse=True)
             main_trunk = branches_sorted[0]
             raw_branches = [list(g.coords) for g in branches_sorted]
         else:
@@ -763,18 +784,20 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
             raw_branches = [list(cl_merged.coords)]
         main_chain = list(main_trunk.coords)
 
-        # Detect traffic island polygons (e.g. triangular islands in junction)
-        island_layers = {'LE-NGOAI', 'DAN_HUONG', 'BO_VIA', 'DAO_TAM_GIAC', 'DAO_GIAO_THONG', 'THGT', 'VIA'}
+        # Traffic islands: only actual traffic island layers (NEVER LE-NGOAI, BO_VIA or VIA which are sidewalk curbs)
+        traffic_islands_geom = []
+        island_layers = {'DAN_HUONG', 'DAO_TAM_GIAC', 'DAO_GIAO_THONG', 'THGT'}
+        min_x, min_y, max_x, max_y = full_net.bounds
         for e in msp:
             l = e.dxf.layer.upper()
-            if l in island_layers:
+            if l in island_layers and e.dxftype() in ['LWPOLYLINE', 'POLYLINE']:
                 is_closed = getattr(e, 'closed', False) or getattr(e, 'is_closed', False)
                 pts = entity_to_wcs_points(e)
                 if len(pts) >= 4 and (is_closed or pts[0] == pts[-1]):
-                    if any(min_x <= p[0] <= max_x and min_y <= p[1] <= max_y for p in pts):
+                    if any(min_x - 10 <= p[0] <= max_x + 10 and min_y - 10 <= p[1] <= max_y + 10 for p in pts):
                         try:
                             poly_isl = Polygon(pts)
-                            if 15.0 <= poly_isl.area <= 400.0 and poly_isl.is_valid:
+                            if 10.0 <= poly_isl.area <= 500.0 and poly_isl.is_valid:
                                 if full_net.distance(poly_isl) <= 15.0:
                                     traffic_islands_geom.append(poly_isl)
                         except Exception:
@@ -784,6 +807,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         main_chain = poly_coords
         tot_len = 0.0
         raw_branches = [main_chain]
+        traffic_islands_geom = []
 
     test_pt = main_chain[0]
     is_vn = _is_vn2000(test_pt[0], test_pt[1])
@@ -813,6 +837,26 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         [round(max(all_lats), 6), round(max(all_lons), 6)]
     ]
 
+    # Count entities per layer and classify categories
+    layer_counts = {}
+    for e in msp:
+        l = e.dxf.get("layer", "")
+        if l:
+            layer_counts[l] = layer_counts.get(l, 0) + 1
+
+    layer_stats = []
+    for l, cnt in sorted(layer_counts.items(), key=lambda x: -x[1]):
+        cat = "Other"
+        u = l.upper()
+        if "TIM" in u or "CENTER" in u: cat = "RoadNetwork"
+        elif "MEP" in u: cat = "LeftEdge"
+        elif "CATNGANG" in u or "COC" in u: cat = "CrossSection"
+        elif "NHA" in u: cat = "Building"
+        elif "CONG" in u: cat = "Drainage"
+        elif "RANH" in u: cat = "Boundary"
+        elif "VIA" in u or "LE" in u: cat = "Sidewalk"
+        layer_stats.append({"name": l, "count": cnt, "category": cat})
+
     mid = len(poly_gps) // 2
     return {
         "success": True,
@@ -826,6 +870,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         "roadSurfacePolygon": poly_gps,
         "roadSurfacePolygons": all_surface_polygons,
         "trafficIslands": islands_gps,
+        "layerStats": layer_stats,
         "leftEdge": poly_gps[:mid],
         "rightEdge": poly_gps[mid:]
     }
