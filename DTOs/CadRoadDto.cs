@@ -67,6 +67,10 @@ namespace RoadGuard.CadParser.DTOs
         [JsonPropertyName("rightEdge")]
         public List<List<double>>? RightEdge { get; set; }
 
+        [JsonProperty("layerStats")]
+        [JsonPropertyName("layerStats")]
+        public List<CadLayerStatItem>? LayerStats { get; set; }
+
         [JsonProperty("error")]
         [JsonPropertyName("error")]
         public string? Error { get; set; }
@@ -74,5 +78,20 @@ namespace RoadGuard.CadParser.DTOs
         [JsonProperty("detail")]
         [JsonPropertyName("detail")]
         public string? Detail { get; set; }
+    }
+
+    public sealed class CadLayerStatItem
+    {
+        [JsonProperty("name")]
+        [JsonPropertyName("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("count")]
+        [JsonPropertyName("count")]
+        public int Count { get; set; }
+
+        [JsonProperty("category")]
+        [JsonPropertyName("category")]
+        public string Category { get; set; } = "Other";
     }
 }
