@@ -872,8 +872,16 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                         b_ls = LineString(b)
                         min_d = main_ls.distance(b_ls)
                         max_d = max(main_ls.distance(LineString([p, p])) for p in b)
-                        if min_d <= 3.0 and max_d >= 3.0:
+                        if min_d <= 3.0 and max_d >= 8.0:  # genuine fork: touches main but deviates significantly
                             genuine_branches.append(b)
+
+                # Deduplicate parallel / duplicate branch lines (e.g. twin curb lines < 2m apart)
+                deduped = []
+                for b in sorted(genuine_branches, key=calc_len, reverse=True):
+                    b_ls = LineString(b)
+                    if not any(LineString(existing).distance(b_ls) < 2.0 for existing in deduped):
+                        deduped.append(b)
+                genuine_branches = deduped
             else:
                 genuine_branches = [b for b in remaining if calc_len(b) >= 15.0]
 
