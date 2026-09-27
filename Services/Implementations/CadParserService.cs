@@ -267,6 +267,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             double roadWidth         = 3.5,
             double slabLength        = 4.0,
             string? centerlineLayerName = null,
+            double? centralMeridian  = null,
             CancellationToken cancellationToken = default)
         {
             // ?? 1. Validate inputs ????????????????????????????????????????? //
@@ -280,8 +281,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             var stopwatch = Stopwatch.StartNew();
 
             _logger.LogInformation(
-                "Starting DXF parse: file={FileName}, size={Size}B, srid={Srid}, tessSegs={Segs}, layer={Layer}",
-                file.FileName, file.Length, srid, tessellationSegments, centerlineLayerName ?? "(auto-detect)");
+                "Starting DXF parse: file={FileName}, size={Size}B, srid={Srid}, tessSegs={Segs}, layer={Layer}, cm={Cm}",
+                file.FileName, file.Length, srid, tessellationSegments, centerlineLayerName ?? "(auto-detect)", centralMeridian);
 
             var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
             try
@@ -299,6 +300,10 @@ namespace RoadGuard.CadParser.Services.Implementations
                     if (!string.IsNullOrWhiteSpace(centerlineLayerName))
                     {
                         bridgeArgs += $" --layer \"{centerlineLayerName}\"";
+                    }
+                    if (centralMeridian.HasValue && centralMeridian.Value > 0)
+                    {
+                        bridgeArgs += $" --cm {centralMeridian.Value}";
                     }
 
                     var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
@@ -581,10 +586,10 @@ namespace RoadGuard.CadParser.Services.Implementations
 
         private async Task<string> RunPythonBridgeAsync(string arguments, CancellationToken cancellationToken)
         {
-            var scriptPath = Path.Combine(AppContext.BaseDirectory, "Services", "PythonBridge", "cad_bridge.py");
+            var scriptPath = Path.Combine(Directory.GetCurrentDirectory(), "Services", "PythonBridge", "cad_bridge.py");
             if (!File.Exists(scriptPath))
             {
-                scriptPath = Path.Combine(Directory.GetCurrentDirectory(), "Services", "PythonBridge", "cad_bridge.py");
+                scriptPath = Path.Combine(AppContext.BaseDirectory, "Services", "PythonBridge", "cad_bridge.py");
             }
 
             if (!File.Exists(scriptPath))

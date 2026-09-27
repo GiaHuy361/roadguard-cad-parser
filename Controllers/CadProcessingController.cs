@@ -69,6 +69,11 @@ namespace RoadGuard.CadParser.Controllers
         /// When provided, geometry extraction is dynamically filtered to this layer.
         /// </summary>
         public string? CenterlineLayerName { get; set; }
+
+        /// <summary>
+        /// Optional custom central meridian for VN-2000 projections (e.g. 105.75 for HCMC/Long An).
+        /// </summary>
+        public double? CentralMeridian { get; set; }
     }
 
     /// <summary>
@@ -279,6 +284,7 @@ namespace RoadGuard.CadParser.Controllers
                     request.RoadWidth,
                     request.SlabLength,
                     request.CenterlineLayerName,
+                    request.CentralMeridian,
                     cancellationToken).ConfigureAwait(false);
 
                 return Ok(result);

@@ -76,6 +76,7 @@ namespace RoadGuard.CadParser.Services.Interfaces
             double roadWidth = 3.5,
             double slabLength = 4.0,
             string? centerlineLayerName = null,
+            double? centralMeridian = null,
             CancellationToken cancellationToken = default);
 
         /// <summary>
