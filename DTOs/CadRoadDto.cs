@@ -43,6 +43,10 @@ namespace RoadGuard.CadParser.DTOs
         [JsonPropertyName("centerline")]
         public List<List<double>> Centerline { get; set; } = new();
 
+        [JsonProperty("centerlineBranches")]
+        [JsonPropertyName("centerlineBranches")]
+        public List<List<List<double>>>? CenterlineBranches { get; set; }
+
         [JsonProperty("roadSurfacePolygon")]
         [JsonPropertyName("roadSurfacePolygon")]
         public List<List<double>> RoadSurfacePolygon { get; set; } = new();
