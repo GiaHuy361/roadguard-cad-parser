@@ -656,8 +656,8 @@ def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
 def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = None, central_meridian: float = None, swap_xy: bool = False) -> dict:
     """
     Extracts the complete road network from CAD (main body, 90-degree curve, bottom horizontal branch,
-    and top triangle intersection).
-    Uses Shapely geometry union and buffering to preserve 100% of curves and junctions.
+    top triangle intersection, and traffic islands).
+    Smoothly tessellates curved bulges (12-24 sample points per curve) and extracts traffic island polygons.
     Transforms coordinates from VN-2000 to WGS-84 GPS [lat, lon].
     """
     doc = ezdxf.readfile(dxf_path_str)
@@ -676,15 +676,11 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
 
     half_w = max(0.5, road_width / 2.0)
 
-    # 1. Collect linear entities directly from modelspace for chosen_layer
+    # 1. Collect linear entities directly from modelspace with bulge & arc tessellation
     primary_lines = []
     for e in msp:
         if e.dxf.layer.upper() == chosen_layer.upper():
-            pts = []
-            if e.dxftype() == 'LWPOLYLINE':
-                pts = [(p[0], p[1]) for p in e.get_points()]
-            elif e.dxftype() == 'LINE':
-                pts = [(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]
+            pts = entity_to_wcs_points(e)
             if pts and len(pts) >= 2:
                 fixed_pts = []
                 for p in pts:
@@ -697,7 +693,6 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                         primary_lines.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
 
     if not primary_lines:
-        # Fallback to walk_entities if msp direct query was empty
         for entity, xform in walk_entities(msp, doc):
             if entity.dxftype() in LINEAR_TYPES:
                 lyr = entity.dxf.get("layer", "")
@@ -732,11 +727,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
     for e in msp:
         lyr = e.dxf.layer.upper()
         if any(k in lyr for k in ("DAUTIM", "TIMDUONGPHU", "TIMPHU", "TIM_PHU")):
-            pts = []
-            if e.dxftype() == 'LWPOLYLINE':
-                pts = [(p[0], p[1]) for p in e.get_points()]
-            elif e.dxftype() == 'LINE':
-                pts = [(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]
+            pts = entity_to_wcs_points(e)
             if pts and len(pts) >= 2:
                 fixed_pts = []
                 for p in pts:
@@ -750,6 +741,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                             road_lines.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
 
     # Use Shapely to form full corridor polygon and network
+    traffic_islands_geom = []
     if HAS_SHAPELY and road_lines:
         full_net = unary_union(road_lines)
         buffered_poly = full_net.buffer(half_w, cap_style='flat', join_style='round')
@@ -770,6 +762,23 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
             main_trunk = cl_merged
             raw_branches = [list(cl_merged.coords)]
         main_chain = list(main_trunk.coords)
+
+        # Detect traffic island polygons (e.g. triangular islands in junction)
+        island_layers = {'LE-NGOAI', 'DAN_HUONG', 'BO_VIA', 'DAO_TAM_GIAC', 'DAO_GIAO_THONG', 'THGT', 'VIA'}
+        for e in msp:
+            l = e.dxf.layer.upper()
+            if l in island_layers:
+                is_closed = getattr(e, 'closed', False) or getattr(e, 'is_closed', False)
+                pts = entity_to_wcs_points(e)
+                if len(pts) >= 4 and (is_closed or pts[0] == pts[-1]):
+                    if any(min_x <= p[0] <= max_x and min_y <= p[1] <= max_y for p in pts):
+                        try:
+                            poly_isl = Polygon(pts)
+                            if 15.0 <= poly_isl.area <= 400.0 and poly_isl.is_valid:
+                                if full_net.distance(poly_isl) <= 15.0:
+                                    traffic_islands_geom.append(poly_isl)
+                        except Exception:
+                            pass
     else:
         poly_coords = list(primary_lines[0].coords)
         main_chain = poly_coords
@@ -792,6 +801,10 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
     cl_gps = proj_pts(main_chain)
     poly_gps = proj_pts(poly_coords)
     branches_gps = [proj_pts(b) for b in raw_branches]
+    islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
+
+    # Combine into roadSurfacePolygons array (main surface + all traffic islands)
+    all_surface_polygons = [poly_gps] + islands_gps
 
     all_lats = [p[0] for p in poly_gps]
     all_lons = [p[1] for p in poly_gps]
@@ -811,6 +824,8 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         "centerline": cl_gps,
         "centerlineBranches": branches_gps,
         "roadSurfacePolygon": poly_gps,
+        "roadSurfacePolygons": all_surface_polygons,
+        "trafficIslands": islands_gps,
         "leftEdge": poly_gps[:mid],
         "rightEdge": poly_gps[mid:]
     }

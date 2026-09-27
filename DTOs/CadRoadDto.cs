@@ -51,6 +51,14 @@ namespace RoadGuard.CadParser.DTOs
         [JsonPropertyName("roadSurfacePolygon")]
         public List<List<double>> RoadSurfacePolygon { get; set; } = new();
 
+        [JsonProperty("roadSurfacePolygons")]
+        [JsonPropertyName("roadSurfacePolygons")]
+        public List<List<List<double>>>? RoadSurfacePolygons { get; set; }
+
+        [JsonProperty("trafficIslands")]
+        [JsonPropertyName("trafficIslands")]
+        public List<List<List<double>>>? TrafficIslands { get; set; }
+
         [JsonProperty("leftEdge")]
         [JsonPropertyName("leftEdge")]
         public List<List<double>>? LeftEdge { get; set; }
