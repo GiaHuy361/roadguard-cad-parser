@@ -91,9 +91,12 @@ def _is_vn2000_swapped(x, y) -> bool:
 # Projection
 # =============================================================================
 
-def detect_central_meridian(x: float) -> float:
+def detect_central_meridian(x: float, y: float = None) -> float:
+    if y is not None:
+        if 1_000_000 <= y <= 1_350_000 and 500_000 <= x <= 700_000:
+            return 105.75
     if x < 300000:   return 102.0
-    elif x < 600000: return 105.0
+    elif x < 600000: return 105.75 if (y is not None and y < 1_500_000) else 105.0
     elif x < 900000: return 108.0
     else:            return 111.0
 
@@ -109,7 +112,7 @@ def make_vn2000_transformer(cm: float):
     return Transformer.from_crs(CRS.from_proj4(proj), CRS.from_epsg(4326), always_xy=True)
 
 
-def project_points(points_xy: list, target_srid: int = 4326) -> list:
+def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = None) -> list:
     if not points_xy:
         return []
     x0, y0 = points_xy[0]
@@ -118,23 +121,27 @@ def project_points(points_xy: list, target_srid: int = 4326) -> list:
     if not HAS_PYPROJ:
         return [_manual_utm(x, y) for x, y in points_xy]
 
-    cm = detect_central_meridian(x0)
-    proj_in = (
-        f"+proj=tmerc +lat_0=0 +lon_0={cm} +k=0.9999 "
-        f"+x_0=500000 +y_0=0 +ellps=WGS84 "
-        f"+towgs84=-191.90441429,-39.30318279,-111.45032835,"
-        f"-0.00928836,0.01975479,-0.00427372,0.252906278 "
-        f"+units=m +no_defs"
-    )
-    crs_in = CRS.from_proj4(proj_in)
-    crs_out = CRS.from_epsg(target_srid)
-    tf = Transformer.from_crs(crs_in, crs_out, always_xy=True)
+    cm = custom_cm if (custom_cm and custom_cm > 0) else detect_central_meridian(x0, y0)
+    if target_srid == 4326:
+        tf = make_vn2000_transformer(cm)
+    else:
+        proj_in = (
+            f"+proj=tmerc +lat_0=0 +lon_0={cm} +k=0.9999 "
+            f"+x_0=500000 +y_0=0 +ellps=WGS84 "
+            f"+towgs84=-191.90441429,-39.30318279,-111.45032835,"
+            f"-0.00928836,0.01975479,-0.00427372,0.252906278 "
+            f"+units=m +no_defs"
+        )
+        crs_in = CRS.from_proj4(proj_in)
+        crs_out = CRS.from_epsg(target_srid)
+        tf = Transformer.from_crs(crs_in, crs_out, always_xy=True)
+
     lons, lats = tf.transform([p[0] for p in points_xy], [p[1] for p in points_xy])
     return [[float(lon), float(lat)] for lon, lat in zip(lons, lats)]
 
 
-def project_to_wgs84(points_xy: list) -> list:
-    return project_points(points_xy, 4326)
+def project_to_wgs84(points_xy: list, custom_cm: float = None) -> list:
+    return project_points(points_xy, 4326, custom_cm=custom_cm)
 
 
 def _manual_utm(easting, northing):
@@ -369,7 +376,9 @@ def _detect_centerline_layer(msp, doc):
         total = sum(math.hypot(seg[i][0] - seg[i - 1][0], seg[i][1] - seg[i - 1][1])
                     for seg in segs for i in range(1, len(seg)))
         if total >= MIN_CENTERLINE_LENGTH:
-            scored_layers[l] = (sc, total)
+            length_factor = min(1.0, total / 300.0)
+            final_score = sc * length_factor + min(500.0, total * 0.5)
+            scored_layers[l] = (final_score, total)
             
     if scored_layers:
         best_layer = max(scored_layers, key=lambda l: (scored_layers[l][0], scored_layers[l][1]))
@@ -382,7 +391,7 @@ def _detect_centerline_layer(msp, doc):
 # Extract geometry (RFC 7946 GeoJSON FeatureCollection output)
 # =============================================================================
 
-def extract_geometries(dxf_path_str, target_layer=None, srid=4326):
+def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_meridian: float = None):
     doc = ezdxf.readfile(dxf_path_str)
     msp = doc.modelspace()
     all_layers = set(l.dxf.name for l in doc.layers if l.dxf.name)
@@ -440,7 +449,7 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326):
         if len(pts) < 2:
             continue
 
-        projected = project_to_wgs84(pts) if srid == 4326 else project_points(pts, srid)
+        projected = project_to_wgs84(pts, custom_cm=central_meridian) if srid == 4326 else project_points(pts, srid, custom_cm=central_meridian)
         if len(projected) < 2:
             continue
 
@@ -782,18 +791,21 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
 
         # Automatically chain connected segments into the longest continuous main road corridor (West to East)
         def chain_longest_corridor(branches):
+            def calc_len(pts):
+                return sum(math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) for i in range(len(pts) - 1))
+
             if not branches:
-                return [], []
+                return [], [], 0.0
             if len(branches) == 1:
-                return branches[0], []
+                b0 = branches[0]
+                if b0 and b0[0][0] > b0[-1][0]:
+                    b0 = b0[::-1]
+                return b0, [], calc_len(b0)
 
             n = len(branches)
             best_chain = []
             best_len = -1
             best_indices = set()
-
-            def calc_len(pts):
-                return sum(math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) for i in range(len(pts) - 1))
 
             for start_i in range(n):
                 for start_rev in [False, True]:
@@ -868,7 +880,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
 
     test_pt = main_chain[0]
     is_vn = _is_vn2000(test_pt[0], test_pt[1])
-    effective_cm = central_meridian if (central_meridian and central_meridian > 0) else detect_central_meridian(test_pt[0])
+    effective_cm = central_meridian if (central_meridian and central_meridian > 0) else detect_central_meridian(test_pt[0], test_pt[1])
 
     if is_vn and HAS_PYPROJ:
         tf_custom = make_vn2000_transformer(effective_cm)
@@ -1142,6 +1154,7 @@ def main():
     pp = sub.add_parser("parse")
     pp.add_argument("dxf_path"); pp.add_argument("--layer", default=None)
     pp.add_argument("--srid", type=int, default=4326)
+    pp.add_argument("--cm", type=float, default=None, help="Custom Central Meridian")
 
     rpp = sub.add_parser("parse-road")
     rpp.add_argument("dxf_path")
@@ -1168,7 +1181,7 @@ def main():
         if args.command == "get-layers":
             print(json.dumps({"success": True, "layers": get_layers(args.dxf_path)}))
         elif args.command == "parse":
-            print(json.dumps(extract_geometries(args.dxf_path, args.layer, args.srid)))
+            print(json.dumps(extract_geometries(args.dxf_path, args.layer, args.srid, getattr(args, "cm", None))))
         elif args.command == "parse-road":
             print(json.dumps(parse_road(
                 args.dxf_path,
