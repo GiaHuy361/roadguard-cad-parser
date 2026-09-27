@@ -776,13 +776,70 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
 
         cl_merged = linemerge(full_net) if full_net.geom_type == 'MultiLineString' else full_net
         if hasattr(cl_merged, 'geoms'):
-            branches_sorted = sorted([g for g in cl_merged.geoms if g.length > 0.5], key=lambda g: g.length, reverse=True)
-            main_trunk = branches_sorted[0]
-            raw_branches = [list(g.coords) for g in branches_sorted]
+            raw_branches = [list(g.coords) for g in cl_merged.geoms if g.length > 0.5]
         else:
-            main_trunk = cl_merged
             raw_branches = [list(cl_merged.coords)]
-        main_chain = list(main_trunk.coords)
+
+        # Automatically chain connected segments into the longest continuous main road corridor (West to East)
+        def chain_longest_corridor(branches):
+            if not branches:
+                return [], []
+            if len(branches) == 1:
+                return branches[0], []
+
+            n = len(branches)
+            best_chain = []
+            best_len = -1
+            best_indices = set()
+
+            def calc_len(pts):
+                return sum(math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) for i in range(len(pts) - 1))
+
+            for start_i in range(n):
+                for start_rev in [False, True]:
+                    b_start = branches[start_i][::-1] if start_rev else branches[start_i]
+                    curr_pts = list(b_start)
+                    used = {start_i}
+                    while True:
+                        last_pt = curr_pts[-1]
+                        found_next = False
+                        for j in range(n):
+                            if j in used: continue
+                            bj = branches[j]
+                            d_start = math.hypot(bj[0][0] - last_pt[0], bj[0][1] - last_pt[1])
+                            d_end = math.hypot(bj[-1][0] - last_pt[0], bj[-1][1] - last_pt[1])
+                            if d_start < 2.5:
+                                curr_pts.extend(bj[1:])
+                                used.add(j)
+                                found_next = True
+                                break
+                            elif d_end < 2.5:
+                                curr_pts.extend(bj[::-1][1:])
+                                used.add(j)
+                                found_next = True
+                                break
+                        if not found_next:
+                            break
+                    total_l = calc_len(curr_pts)
+                    if total_l > best_len:
+                        best_len = total_l
+                        best_chain = curr_pts
+                        best_indices = set(used)
+
+            # Ensure orientation is West-to-East (start has smaller X coordinate in WCS)
+            if best_chain and best_chain[0][0] > best_chain[-1][0]:
+                best_chain = best_chain[::-1]
+
+            remaining = [branches[i] for i in range(n) if i not in best_indices]
+            return best_chain, remaining, best_len
+
+        chained_main, remaining_branches, chained_len = chain_longest_corridor(raw_branches)
+        if chained_main and len(chained_main) >= 2:
+            main_chain = chained_main
+            raw_branches = remaining_branches
+            tot_len = chained_len
+        else:
+            main_chain = raw_branches[0] if raw_branches else []
 
         # Traffic islands: only actual traffic island layers (NEVER LE-NGOAI, BO_VIA or VIA which are sidewalk curbs)
         traffic_islands_geom = []
