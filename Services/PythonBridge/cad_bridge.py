@@ -814,24 +814,45 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                     used = {start_i}
                     while True:
                         last_pt = curr_pts[-1]
-                        found_next = False
+                        prev_pt = curr_pts[-2] if len(curr_pts) >= 2 else None
+                        best_cand = None
+                        best_cand_d = 999.0
+                        best_cand_rev = False
+
                         for j in range(n):
                             if j in used: continue
                             bj = branches[j]
                             d_start = math.hypot(bj[0][0] - last_pt[0], bj[0][1] - last_pt[1])
                             d_end = math.hypot(bj[-1][0] - last_pt[0], bj[-1][1] - last_pt[1])
                             if d_start < 2.5:
-                                curr_pts.extend(bj[1:])
-                                used.add(j)
-                                found_next = True
-                                break
+                                if prev_pt and len(bj) >= 2:
+                                    v_in = (last_pt[0] - prev_pt[0], last_pt[1] - prev_pt[1])
+                                    v_out = (bj[1][0] - bj[0][0], bj[1][1] - bj[0][1])
+                                    l_in = math.hypot(*v_in); l_out = math.hypot(*v_out)
+                                    if l_in > 0 and l_out > 0:
+                                        dot = (v_in[0]*v_out[0] + v_in[1]*v_out[1]) / (l_in * l_out)
+                                        if dot < -0.5: continue
+                                if d_start < best_cand_d:
+                                    best_cand_d = d_start; best_cand = j; best_cand_rev = False
                             elif d_end < 2.5:
-                                curr_pts.extend(bj[::-1][1:])
-                                used.add(j)
-                                found_next = True
-                                break
-                        if not found_next:
+                                if prev_pt and len(bj) >= 2:
+                                    v_in = (last_pt[0] - prev_pt[0], last_pt[1] - prev_pt[1])
+                                    v_out = (bj[-2][0] - bj[-1][0], bj[-2][1] - bj[-1][1])
+                                    l_in = math.hypot(*v_in); l_out = math.hypot(*v_out)
+                                    if l_in > 0 and l_out > 0:
+                                        dot = (v_in[0]*v_out[0] + v_in[1]*v_out[1]) / (l_in * l_out)
+                                        if dot < -0.5: continue
+                                if d_end < best_cand_d:
+                                    best_cand_d = d_end; best_cand = j; best_cand_rev = True
+
+                        if best_cand is not None:
+                            bj = branches[best_cand]
+                            pts_to_add = bj[::-1] if best_cand_rev else bj
+                            curr_pts.extend(pts_to_add[1:])
+                            used.add(best_cand)
+                        else:
                             break
+
                     total_l = calc_len(curr_pts)
                     if total_l > best_len:
                         best_len = total_l
@@ -843,7 +864,20 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                 best_chain = best_chain[::-1]
 
             remaining = [branches[i] for i in range(n) if i not in best_indices]
-            return best_chain, remaining, best_len
+            genuine_branches = []
+            if best_chain and len(best_chain) >= 2 and HAS_SHAPELY:
+                main_ls = LineString(best_chain)
+                for b in remaining:
+                    if calc_len(b) >= 15.0:
+                        b_ls = LineString(b)
+                        min_d = main_ls.distance(b_ls)
+                        max_d = max(main_ls.distance(LineString([p, p])) for p in b)
+                        if min_d <= 3.0 and max_d >= 3.0:
+                            genuine_branches.append(b)
+            else:
+                genuine_branches = [b for b in remaining if calc_len(b) >= 15.0]
+
+            return best_chain, genuine_branches, best_len
 
         chained_main, remaining_branches, chained_len = chain_longest_corridor(raw_branches)
         if chained_main and len(chained_main) >= 2:
