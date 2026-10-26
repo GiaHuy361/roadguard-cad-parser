@@ -123,6 +123,52 @@ def make_vn2000_transformer(cm: float, scale_factor: float = 0.9999):
     return Transformer.from_crs(CRS.from_proj4(proj), CRS.from_epsg(4326), always_xy=True)
 
 
+def make_wgs84_to_vn2000_transformer(cm: float, scale_factor: float = 0.9999):
+    k0 = _normalize_scale_factor(scale_factor)
+    proj = (
+        f"+proj=tmerc +lat_0=0 +lon_0={cm} +k={k0} "
+        f"+x_0=500000 +y_0=0 +ellps=WGS84 "
+        f"+towgs84=-191.90441429,-39.30318279,-111.45032835,"
+        f"-0.00928836,0.01975479,-0.00427372,0.252906278 "
+        f"+units=m +no_defs"
+    )
+    return Transformer.from_crs(CRS.from_epsg(4326), CRS.from_proj4(proj), always_xy=True)
+
+
+def project_wgs84_to_vn2000(points_lonlat: list, custom_cm: float, scale_factor: float = 0.9999) -> list:
+    if not points_lonlat:
+        return []
+    if not custom_cm or custom_cm < 100.0 or custom_cm > 112.0:
+        raise ValueError("Chưa cấu hình hệ quy chiếu VN-2000 (cần kinh tuyến trục L₀ hợp lệ từ 100° đến 112°).")
+    k0 = _normalize_scale_factor(scale_factor)
+    tf = make_wgs84_to_vn2000_transformer(custom_cm, k0)
+    eastings, northings = tf.transform([p[0] for p in points_lonlat], [p[1] for p in points_lonlat])
+    out = []
+    for lon, lat, e, n in zip([p[0] for p in points_lonlat], [p[1] for p in points_lonlat], eastings, northings):
+        out.append({
+            "lon": round(float(lon), 8),
+            "lat": round(float(lat), 8),
+            "xNorth": round(float(n), 4),
+            "yEast": round(float(e), 4),
+            "easting": round(float(e), 4),
+            "northing": round(float(n), 4),
+            "centralMeridian": float(custom_cm),
+            "scaleFactor": k0,
+            "zoneType": "6°" if abs(k0 - 0.9996) < 1e-5 else "3°",
+        })
+    return out
+
+
+def project_wgs84_to_utm(points_lonlat: list, target_srid: int = 32648) -> list:
+    if target_srid not in (32648, 32649):
+        raise ValueError(f"sourceCrs phải là 32648 (UTM 48N) hoặc 32649 (UTM 49N), nhận được: {target_srid}")
+    if not points_lonlat:
+        return []
+    tf = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_epsg(target_srid), always_xy=True)
+    xs, ys = tf.transform([p[0] for p in points_lonlat], [p[1] for p in points_lonlat])
+    return [{"x": round(float(x), 4), "y": round(float(y), 4)} for x, y in zip(xs, ys)]
+
+
 def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = None, scale_factor: float = 0.9999) -> list:
     if not points_xy:
         return []
@@ -1447,6 +1493,185 @@ def render_dxf_to_png(
         "imageSizePx": size_px
     }
 
+def transform_crs_payload(payload_path: str) -> dict:
+    """
+    Bidirectional CRS transformation endpoint (WGS-84 <-> VN-2000) using pyproj.
+    Supports single point, batch point list, and GeoJSON geometries.
+    """
+    with open(payload_path, "r", encoding="utf-8-sig") as fh:
+        payload = json.load(fh)
+
+    direction = str(payload.get("direction", "WGS84_TO_VN2000")).strip().upper()
+    cm_raw = payload.get("centralMeridian")
+    if cm_raw is None or str(cm_raw).strip() == "":
+        return {
+            "success": False,
+            "error": "UnconfiguredCrs",
+            "detail": "Chưa cấu hình hệ quy chiếu VN-2000 (cần kinh tuyến trục L₀ và múi chiếu 3°/6°). Không thể tự suy đoán tham số VN-2000."
+        }
+    try:
+        cm = float(cm_raw)
+    except Exception:
+        return {"success": False, "error": "InvalidCentralMeridian", "detail": "Kinh tuyến trục L₀ không hợp lệ."}
+
+    if cm < 100.0 or cm > 112.0:
+        return {"success": False, "error": "InvalidCentralMeridian", "detail": f"Kinh tuyến trục L₀ ({cm}°) nằm ngoài phạm vi hợp lệ [100°..112°]."}
+
+    k0 = _normalize_scale_factor(payload.get("scaleFactor", 0.9999))
+    axis_order = str(payload.get("axisOrder", "VN2000_XY")).strip().upper()
+    pts = payload.get("points", [])
+    if not isinstance(pts, list) or len(pts) == 0:
+        return {"success": False, "error": "EmptyPoints", "detail": "Danh sách điểm cần chuyển đổi đang trống."}
+
+    results = []
+    if direction == "WGS84_TO_VN2000":
+        tf = make_wgs84_to_vn2000_transformer(cm, k0)
+        for idx, pt in enumerate(pts):
+            lon = float(pt.get("lon") if isinstance(pt, dict) else pt[0])
+            lat = float(pt.get("lat") if isinstance(pt, dict) else pt[1])
+            if not (-180.0 <= lon <= 180.0 and -90.0 <= lat <= 90.0):
+                return {"success": False, "error": "InvalidWgs84", "detail": f"Điểm #{idx + 1} nằm ngoài phạm vi WGS-84 hợp lệ."}
+            e, n = tf.transform(lon, lat)
+            results.append({
+                "index": idx + 1,
+                "lon": round(float(lon), 8),
+                "lat": round(float(lat), 8),
+                "xNorth": round(float(n), 4),
+                "yEast": round(float(e), 4),
+                "easting": round(float(e), 4),
+                "northing": round(float(n), 4),
+            })
+    elif direction == "VN2000_TO_WGS84":
+        tf = make_vn2000_transformer(cm, k0)
+        for idx, pt in enumerate(pts):
+            if isinstance(pt, dict):
+                if "easting" in pt and "northing" in pt:
+                    e, n = float(pt["easting"]), float(pt["northing"])
+                elif axis_order == "CAD_EN":
+                    e, n = float(pt.get("x", pt.get("yEast", 0))), float(pt.get("y", pt.get("xNorth", 0)))
+                else:
+                    n, e = float(pt.get("x", pt.get("xNorth", 0))), float(pt.get("y", pt.get("yEast", 0)))
+            else:
+                if axis_order == "CAD_EN":
+                    e, n = float(pt[0]), float(pt[1])
+                else:
+                    n, e = float(pt[0]), float(pt[1])
+            if not (_VN2000_X_MIN <= e <= _VN2000_X_MAX and _VN2000_Y_MIN <= n <= _VN2000_Y_MAX):
+                return {"success": False, "error": "InvalidVn2000", "detail": f"Điểm #{idx + 1} (E={e}, N={n}) nằm ngoài phạm vi VN-2000 hợp lệ."}
+            lon, lat = tf.transform(e, n)
+            results.append({
+                "index": idx + 1,
+                "xNorth": round(float(n), 4),
+                "yEast": round(float(e), 4),
+                "easting": round(float(e), 4),
+                "northing": round(float(n), 4),
+                "lon": round(float(lon), 8),
+                "lat": round(float(lat), 8),
+            })
+    else:
+        return {"success": False, "error": "UnsupportedDirection", "detail": f"Hướng chuyển đổi không hợp lệ: {direction}"}
+
+    return {
+        "success": True,
+        "direction": direction,
+        "centralMeridian": cm,
+        "scaleFactor": k0,
+        "zoneType": "6°" if abs(k0 - 0.9996) < 1e-5 else "3°",
+        "crsMetadata": _build_crs_metadata(cm, k0, axis_order),
+        "points": results,
+    }
+
+
+def build_and_validate_roadguard_draft(payload_path: str) -> dict:
+    """
+    Builds and validates a RoadGuard GeometryDraftInput JSON payload (COORDINATES path)
+    strictly matching RoadGuardSystem GeometryEngine.ValidateAndNormalizeInput.
+    """
+    with open(payload_path, "r", encoding="utf-8-sig") as fh:
+        payload = json.load(fh)
+
+    source_crs = int(payload.get("sourceCrs", 32648))
+    if source_crs not in (32648, 32649):
+        return {"success": False, "error": "InvalidSourceCrs", "detail": "sourceCrs chỉ chấp nhận 32648 (EPSG:32648 UTM 48N) hoặc 32649 (EPSG:32649 UTM 49N)."}
+
+    road_code = str(payload.get("roadCode", "")).strip()
+    if not road_code or len(road_code) > 80:
+        return {"success": False, "error": "InvalidRoadCode", "detail": "roadCode là bắt buộc và tối đa 80 ký tự."}
+
+    road_name_raw = payload.get("roadName")
+    road_name = str(road_name_raw).strip() if road_name_raw is not None and str(road_name_raw).strip() else None
+    if road_name and len(road_name) > 255:
+        return {"success": False, "error": "InvalidRoadName", "detail": "roadName không được vượt quá 255 ký tự."}
+
+    change_reason = str(payload.get("changeReason", "")).strip()
+    if not change_reason:
+        return {"success": False, "error": "InvalidChangeReason", "detail": "changeReason là bắt buộc."}
+
+    station_origin = float(payload.get("stationOriginMeters", 0.0))
+    road_width = float(payload.get("roadWidth", 7.0))
+    survey_width = float(payload.get("surveyWidthMeters", max(road_width, 7.0)))
+    if road_width <= 0 or survey_width <= 0 or road_width > survey_width:
+        return {"success": False, "error": "InvalidWidth", "detail": "roadWidth và surveyWidthMeters phải > 0 và widthMeters <= surveyWidthMeters."}
+
+    wgs84_coords = payload.get("centerlineWgs84", [])
+    if not isinstance(wgs84_coords, list) or len(wgs84_coords) < 2:
+        return {"success": False, "error": "NotEnoughPoints", "detail": "Tuyến đường phải có ít nhất 2 điểm WGS-84."}
+
+    lonlat_pts = []
+    for pt in wgs84_coords:
+        if isinstance(pt, dict):
+            lonlat_pts.append((float(pt["lon"]), float(pt["lat"])))
+        else:
+            lonlat_pts.append((float(pt[0]), float(pt[1])))
+
+    raw_utm = project_wgs84_to_utm(lonlat_pts, source_crs)
+    dedup_utm = []
+    for pt in raw_utm:
+        if not dedup_utm or abs(pt["x"] - dedup_utm[-1]["x"]) > 1e-9 or abs(pt["y"] - dedup_utm[-1]["y"]) > 1e-9:
+            dedup_utm.append(pt)
+
+    if len(dedup_utm) < 2:
+        return {"success": False, "error": "DegenerateLineString", "detail": "Không đủ 2 điểm phân biệt sau khi loại điểm trùng liền kề."}
+
+    if HAS_SHAPELY:
+        ls = LineString([(p["x"], p["y"]) for p in dedup_utm])
+        if not ls.is_valid or not ls.is_simple or ls.length <= 0:
+            return {"success": False, "error": "InvalidGeometry", "detail": "Hình học tuyến UTM tự cắt hoặc không hợp lệ (IsSimple/IsValid failed)."}
+        utm_length = float(ls.length)
+    else:
+        utm_length = sum(
+            math.hypot(dedup_utm[i + 1]["x"] - dedup_utm[i]["x"], dedup_utm[i + 1]["y"] - dedup_utm[i]["y"])
+            for i in range(len(dedup_utm) - 1)
+        )
+
+    draft = {
+        "sourceKind": "COORDINATES",
+        "sourceCrs": source_crs,
+        "stationOriginMeters": station_origin,
+        "changeReason": change_reason,
+        "coordinates": dedup_utm,
+        "sourceFileId": None,
+        "trackIndex": None,
+        "trackSegmentIndex": None,
+        "widthProfile": [
+            {
+                "fromOffsetMeters": 0,
+                "toOffsetMeters": utm_length,
+                "widthMeters": road_width,
+            }
+        ],
+        "surveyWidthMeters": survey_width,
+        "roadCode": road_code,
+        "roadName": road_name,
+    }
+    return {
+        "success": True,
+        "draft": draft,
+        "utmLengthMeters": utm_length,
+        "pointCount": len(dedup_utm),
+    }
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -1478,6 +1703,12 @@ def main():
     cpp.add_argument("--cm", type=float, default=None)
     cpp.add_argument("--k0", type=float, default=None)
     cpp.add_argument("--axis-order", default=None)
+
+    tcp = sub.add_parser("transform-crs")
+    tcp.add_argument("dxf_path", help="Path to JSON payload file for CRS transformation")
+
+    erd = sub.add_parser("export-roadguard-draft")
+    erd.add_argument("dxf_path", help="Path to JSON payload file for RoadGuard draft export")
 
     rp = sub.add_parser("render")
     rp.add_argument("dxf_path")
@@ -1517,6 +1748,10 @@ def main():
                 scale_factor=getattr(args, "k0", None),
                 axis_order=getattr(args, "axis_order", None)
             ), ensure_ascii=False))
+        elif args.command == "transform-crs":
+            print(json.dumps(transform_crs_payload(args.dxf_path), ensure_ascii=False))
+        elif args.command == "export-roadguard-draft":
+            print(json.dumps(build_and_validate_roadguard_draft(args.dxf_path), ensure_ascii=False))
         elif args.command == "render":
             print(json.dumps(render_dxf_to_png(
                 args.dxf_path,

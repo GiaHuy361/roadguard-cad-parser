@@ -292,6 +292,48 @@ namespace RoadGuard.CadParser.Services.Implementations
         }
 
         /// <inheritdoc/>
+        public async Task<string> TransformCrsAsync(
+            string payloadJson,
+            CancellationToken cancellationToken = default)
+        {
+            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.json");
+            try
+            {
+                await File.WriteAllTextAsync(tempFile, payloadJson, new System.Text.UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
+                var bridgeArgs = $"transform-crs \"{tempFile}\"";
+                return await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                {
+                    try { File.Delete(tempFile); } catch { }
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        public async Task<string> ExportRoadGuardDraftAsync(
+            string payloadJson,
+            CancellationToken cancellationToken = default)
+        {
+            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.json");
+            try
+            {
+                await File.WriteAllTextAsync(tempFile, payloadJson, new System.Text.UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
+                var bridgeArgs = $"export-roadguard-draft \"{tempFile}\"";
+                return await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                {
+                    try { File.Delete(tempFile); } catch { }
+                }
+            }
+        }
+
+        /// <inheritdoc/>
         public async Task<CadRenderOverlayResponse> RenderOverlayAsync(
             IFormFile file,
             string? centerlineLayerName = null,

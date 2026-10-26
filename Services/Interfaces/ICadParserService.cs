@@ -112,5 +112,19 @@ namespace RoadGuard.CadParser.Services.Interfaces
             double? scaleFactor = null,
             string? axisOrder = null,
             CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Performs bidirectional CRS transformation (WGS-84 &lt;-&gt; VN-2000) via the Python pyproj bridge.
+        /// </summary>
+        Task<string> TransformCrsAsync(
+            string payloadJson,
+            CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Builds and validates a RoadGuard GeometryDraftInput JSON payload via the Python pyproj/shapely bridge.
+        /// </summary>
+        Task<string> ExportRoadGuardDraftAsync(
+            string payloadJson,
+            CancellationToken cancellationToken = default);
     }
 }

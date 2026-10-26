@@ -599,6 +599,90 @@ namespace RoadGuard.CadParser.Controllers
         /// <summary>
         /// Lightweight liveness probe for load-balancer and k8s health checks.
         /// </summary>
+        // ================================================================== //
+        //  POST /api/cad/transform-crs                                        //
+        // ================================================================== //
+
+        /// <summary>
+        /// Performs bidirectional CRS transformation between WGS-84 and VN-2000 using pyproj.
+        /// </summary>
+        [HttpPost("transform-crs")]
+        [Consumes("application/json")]
+        [Produces("application/json")]
+        public async Task<IActionResult> TransformCrs(
+            [FromBody] object payload,
+            CancellationToken cancellationToken = default)
+        {
+            if (payload is null)
+            {
+                return BadRequest(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.BadRequest,
+                    Error      = "EmptyPayload",
+                    Detail     = "Payload chuyển đổi tọa độ không được để trống."
+                });
+            }
+
+            try
+            {
+                var rawJson = payload.ToString() ?? "{}";
+                var resultJson = await _parserService.TransformCrsAsync(rawJson, cancellationToken).ConfigureAwait(false);
+                return Content(resultJson, "application/json");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error during TransformCrs.");
+                return StatusCode(StatusCodes.Status500InternalServerError, new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.InternalServerError,
+                    Error      = "InternalServerError",
+                    Detail     = ex.Message
+                });
+            }
+        }
+
+        // ================================================================== //
+        //  POST /api/cad/export-roadguard-draft                               //
+        // ================================================================== //
+
+        /// <summary>
+        /// Builds and validates a RoadGuard GeometryDraftInput JSON payload (COORDINATES path).
+        /// </summary>
+        [HttpPost("export-roadguard-draft")]
+        [Consumes("application/json")]
+        [Produces("application/json")]
+        public async Task<IActionResult> ExportRoadGuardDraft(
+            [FromBody] object payload,
+            CancellationToken cancellationToken = default)
+        {
+            if (payload is null)
+            {
+                return BadRequest(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.BadRequest,
+                    Error      = "EmptyPayload",
+                    Detail     = "Payload xuất RoadGuard Draft không được để trống."
+                });
+            }
+
+            try
+            {
+                var rawJson = payload.ToString() ?? "{}";
+                var resultJson = await _parserService.ExportRoadGuardDraftAsync(rawJson, cancellationToken).ConfigureAwait(false);
+                return Content(resultJson, "application/json");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error during ExportRoadGuardDraft.");
+                return StatusCode(StatusCodes.Status500InternalServerError, new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.InternalServerError,
+                    Error      = "InternalServerError",
+                    Detail     = ex.Message
+                });
+            }
+        }
+
         [HttpGet("health")]
         [ProducesResponseType(StatusCodes.Status200OK)]
         public IActionResult Health()
