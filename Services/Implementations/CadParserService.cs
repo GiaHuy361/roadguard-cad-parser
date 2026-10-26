@@ -73,15 +73,15 @@ namespace RoadGuard.CadParser.Services.Implementations
         //  Dependencies                                                        //
         // ------------------------------------------------------------------ //
         private readonly ILogger<CadParserService> _logger;
-        private readonly RoadGuardDbContext         _db;
+        private readonly RoadGuardDbContext?        _db;
 
         // ------------------------------------------------------------------ //
         //  Constructor                                                         //
         // ------------------------------------------------------------------ //
-        public CadParserService(ILogger<CadParserService> logger, RoadGuardDbContext db)
+        public CadParserService(ILogger<CadParserService> logger, RoadGuardDbContext? db = null)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-            _db     = db     ?? throw new ArgumentNullException(nameof(db));
+            _db     = db;   // null when no database is configured (persistence is optional)
         }
 
         // ================================================================== //
@@ -212,6 +212,54 @@ namespace RoadGuard.CadParser.Services.Implementations
                 if (File.Exists(tempFile))
                 {
                     try { File.Delete(tempFile); } catch { /* best-effort cleanup */ }
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        public async Task<CadParseRoadResponse> ParseCoordsAsync(
+            string coordinatesText,
+            double roadWidth = 7.0,
+            double? centralMeridian = null,
+            CancellationToken cancellationToken = default)
+        {
+            if (string.IsNullOrWhiteSpace(coordinatesText))
+            {
+                return new CadParseRoadResponse
+                {
+                    Success = false,
+                    Error   = "EmptyCoordinates",
+                    Detail  = "Vui lòng nhập danh sách tọa độ VN-2000."
+                };
+            }
+
+            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.json");
+            try
+            {
+                var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new { text = coordinatesText });
+                await File.WriteAllTextAsync(tempFile, payload, new System.Text.UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
+
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                var bridgeArgs = $"parse-coords \"{tempFile}\" --width {roadWidth.ToString(inv)}";
+                if (centralMeridian.HasValue && centralMeridian.Value > 0)
+                {
+                    bridgeArgs += $" --cm {centralMeridian.Value.ToString(inv)}";
+                }
+
+                var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+                var result = Newtonsoft.Json.JsonConvert.DeserializeObject<CadParseRoadResponse>(json);
+                return result ?? new CadParseRoadResponse
+                {
+                    Success = false,
+                    Error   = "ParseCoordsFailed",
+                    Detail  = "Không thể dựng tuyến từ danh sách tọa độ."
+                };
+            }
+            finally
+            {
+                if (File.Exists(tempFile))
+                {
+                    try { File.Delete(tempFile); } catch { }
                 }
             }
         }
@@ -1507,6 +1555,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             List<Feature> features,
             CancellationToken cancellationToken)
         {
+            if (_db is null) return;   // persistence disabled (no connection string configured)
+
             try
             {
                 var ntsFactory = new NtsGeometryFactory(new NtsPrecisionModel(), srid);

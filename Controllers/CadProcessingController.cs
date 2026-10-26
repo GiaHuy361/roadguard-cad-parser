@@ -403,6 +403,65 @@ namespace RoadGuard.CadParser.Controllers
         }
 
         // ================================================================== //
+        //  POST /api/cad/parse-coords                                         //
+        // ================================================================== //
+
+        /// <summary>
+        /// Builds a road (centerline, corridor polygon, edges) from manually typed VN-2000 coordinates
+        /// and converts them to WGS-84. Same response shape as parse-road.
+        /// </summary>
+        [HttpPost("parse-coords")]
+        [Consumes("application/json")]
+        [Produces("application/json")]
+        [ProducesResponseType(typeof(CadParseRoadResponse), StatusCodes.Status200OK)]
+        [ProducesResponseType(typeof(CadParserErrorResponse), StatusCodes.Status400BadRequest)]
+        public async Task<IActionResult> ParseCoords(
+            [FromBody] CadParseCoordsRequest request,
+            CancellationToken cancellationToken = default)
+        {
+            if (request is null || string.IsNullOrWhiteSpace(request.Coordinates))
+            {
+                return BadRequest(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.BadRequest,
+                    Error      = "EmptyCoordinates",
+                    Detail     = "Vui lòng nhập danh sách tọa độ VN-2000."
+                });
+            }
+
+            try
+            {
+                var result = await _parserService.ParseCoordsAsync(
+                    request.Coordinates,
+                    request.RoadWidth > 0 ? request.RoadWidth : 7.0,
+                    request.CentralMeridian,
+                    cancellationToken).ConfigureAwait(false);
+
+                if (!result.Success)
+                {
+                    return BadRequest(new CadParserErrorResponse
+                    {
+                        StatusCode = (int)HttpStatusCode.BadRequest,
+                        Error      = result.Error ?? "ParseCoordsFailed",
+                        Detail     = result.Detail ?? "Không thể dựng tuyến từ tọa độ đã nhập."
+                    });
+                }
+
+                return Ok(result);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unhandled exception during ParseCoords.");
+                return StatusCode((int)HttpStatusCode.InternalServerError, new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.InternalServerError,
+                    Error      = "InternalServerError",
+                    Detail     = ex.Message
+                });
+            }
+        }
+
+        // ================================================================== //
         //  POST /api/cad/render-overlay                                       //
         // ================================================================== //
 

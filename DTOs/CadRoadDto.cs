@@ -13,6 +13,14 @@ namespace RoadGuard.CadParser.DTOs
         public double? CentralMeridian { get; set; }
     }
 
+    public sealed class CadParseCoordsRequest
+    {
+        /// <summary>One VN-2000 point per line, e.g. "1199145.22, 614235.15" (Northing, Easting; order auto-detected).</summary>
+        public string Coordinates { get; set; } = string.Empty;
+        public double RoadWidth { get; set; } = 7.0;
+        public double? CentralMeridian { get; set; }
+    }
+
     public sealed class CadParseRoadResponse
     {
         [JsonProperty("success")]

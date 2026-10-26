@@ -1,0 +1,8 @@
+bin/
+obj/
+.git/
+.vs/
+*.dxf
+*.png
+test_*.json
+appsettings.Development.json

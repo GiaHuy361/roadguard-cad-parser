@@ -1,4 +1,4 @@
-﻿using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.DependencyInjection;
@@ -35,12 +35,25 @@ builder.Logging.AddDebug();
 builder.Services.AddScoped<ICadParserService, CadParserService>();
 
 // EF Core + SQL Server with NetTopologySuite spatial extension //
-builder.Services.AddDbContext<RoadGuardDbContext>(options =>
-    options.UseSqlServer(
-        builder.Configuration.GetConnectionString("Default"),
-        sqlOptions => sqlOptions.UseNetTopologySuite()
-    )
-);
+// Persistence is OPTIONAL: when no "ConnectionStrings:Default" is configured (e.g. cloud
+// deploy without SQL Server) the DbContext is not registered and parsing still works.
+var defaultConnection = builder.Configuration.GetConnectionString("Default");
+if (!string.IsNullOrWhiteSpace(defaultConnection))
+{
+    builder.Services.AddDbContext<RoadGuardDbContext>(options =>
+        options.UseSqlServer(
+            defaultConnection,
+            sqlOptions => sqlOptions.UseNetTopologySuite()
+        )
+    );
+}
+
+// Render / container platforms provide the listening port via the PORT env variable.
+var hostedPort = Environment.GetEnvironmentVariable("PORT");
+if (!string.IsNullOrWhiteSpace(hostedPort))
+{
+    builder.WebHost.UseUrls($"http://0.0.0.0:{hostedPort}");
+}
 
 // ── ASP.NET Core MVC + Newtonsoft.Json ──────────────────────────────────── //
 // Newtonsoft.Json is required because GeoJSON.Net uses interface-typed geometry
@@ -94,12 +107,19 @@ builder.Services.AddSwaggerGen(c =>
 // ── CORS (configurable for production) ──────────────────────────────────── //
 builder.Services.AddCors(options =>
 {
+    var allowedOrigins = (Environment.GetEnvironmentVariable("CORS_ORIGINS") ?? string.Empty)
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
     options.AddPolicy("AllowAll", policy =>
     {
-        policy
-            .AllowAnyOrigin()
-            .AllowAnyMethod()
-            .AllowAnyHeader();
+        if (allowedOrigins.Length > 0)
+        {
+            policy.WithOrigins(allowedOrigins).AllowAnyMethod().AllowAnyHeader();
+        }
+        else
+        {
+            policy.AllowAnyOrigin().AllowAnyMethod().AllowAnyHeader();
+        }
     });
 });
 
@@ -129,7 +149,7 @@ else
 }
 
 // Only enforce HTTPS redirection in Production so local HTTP dev works seamlessly with Vite (http://localhost:5173)
-if (!app.Environment.IsDevelopment())
+if (!app.Environment.IsDevelopment() && string.IsNullOrWhiteSpace(hostedPort))
 {
     app.UseHttpsRedirection();
 }

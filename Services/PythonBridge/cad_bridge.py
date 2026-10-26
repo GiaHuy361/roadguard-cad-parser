@@ -986,6 +986,115 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         "rightEdge": poly_gps[mid:]
     }
 
+def parse_coords(payload_path: str, road_width: float = 7.0, central_meridian: float = None) -> dict:
+    """
+    Builds a road (centerline, surface polygon, edges) from manually typed VN-2000 points.
+    Input file is JSON: {"text": "<one 'N, E' or 'E, N' pair per line>"}.
+    Axis order is auto-detected per point (Northing ~1.0-2.6M, Easting ~0.1-0.95M).
+    Output has the same shape as parse_road (GPS values are [lat, lon]).
+    """
+    import re
+    with open(payload_path, "r", encoding="utf-8-sig") as fh:
+        payload = json.load(fh)
+    text = payload.get("text", "") if isinstance(payload, dict) else ""
+
+    pts = []          # normalized (easting, northing) in metres
+    bad_lines = []
+    for ln_no, line in enumerate(str(text).splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        nums = re.findall(r"-?\d+(?:\.\d+)?", line.replace(";", " "))
+        if len(nums) < 2:
+            bad_lines.append(ln_no)
+            continue
+        a, b = float(nums[0]), float(nums[1])
+        if a > 1_000_000.0 and b < 1_000_000.0:      # "Northing, Easting" (VN-2000 convention)
+            e, n = b, a
+        elif b > 1_000_000.0 and a < 1_000_000.0:    # "Easting, Northing"
+            e, n = a, b
+        else:
+            bad_lines.append(ln_no)
+            continue
+        if not _is_vn2000(e, n):
+            bad_lines.append(ln_no)
+            continue
+        if pts and math.hypot(e - pts[-1][0], n - pts[-1][1]) < 0.01:
+            continue                                  # drop duplicate consecutive points
+        pts.append((e, n))
+
+    if bad_lines:
+        return {"success": False, "error": "InvalidCoordinates",
+                "detail": f"Dòng không hợp lệ (không phải tọa độ VN-2000): {', '.join(map(str, bad_lines[:10]))}"}
+    if len(pts) < 2:
+        return {"success": False, "error": "NotEnoughPoints",
+                "detail": "Cần ít nhất 2 điểm tọa độ VN-2000 khác nhau."}
+
+    # Ribbon with miter correction at each vertex
+    half_w = max(0.5, road_width / 2.0)
+    n_pts = len(pts)
+    seg_norm = []
+    for i in range(n_pts - 1):
+        dx, dy = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]
+        l = math.hypot(dx, dy)
+        seg_norm.append((-dy / l, dx / l))
+    left, right = [], []
+    for i in range(n_pts):
+        if i == 0:
+            nx, ny, scale = seg_norm[0][0], seg_norm[0][1], 1.0
+        elif i == n_pts - 1:
+            nx, ny, scale = seg_norm[-1][0], seg_norm[-1][1], 1.0
+        else:
+            sx = seg_norm[i - 1][0] + seg_norm[i][0]
+            sy = seg_norm[i - 1][1] + seg_norm[i][1]
+            sl = math.hypot(sx, sy)
+            if sl < 1e-6:
+                nx, ny, scale = seg_norm[i][0], seg_norm[i][1], 1.0
+            else:
+                nx, ny = sx / sl, sy / sl
+                cos_half = nx * seg_norm[i][0] + ny * seg_norm[i][1]
+                scale = min(2.0, 1.0 / max(cos_half, 0.5))
+        left.append((pts[i][0] + nx * half_w * scale, pts[i][1] + ny * half_w * scale))
+        right.append((pts[i][0] - nx * half_w * scale, pts[i][1] - ny * half_w * scale))
+    poly = left + right[::-1]
+    poly.append(poly[0])
+
+    total_len = sum(math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) for i in range(n_pts - 1))
+
+    cm = central_meridian if (central_meridian and central_meridian > 0) else detect_central_meridian(pts[0][0], pts[0][1])
+    if HAS_PYPROJ:
+        tf = make_vn2000_transformer(cm)
+        def proj_pts(arr):
+            lons, lats = tf.transform([p[0] for p in arr], [p[1] for p in arr])
+            return [[round(float(la), 6), round(float(lo), 6)] for lo, la in zip(lons, lats)]
+    else:
+        def proj_pts(arr):
+            return [[round(float(v[1]), 6), round(float(v[0]), 6)] for v in (_manual_utm(p[0], p[1]) for p in arr)]
+
+    cl_gps = proj_pts(pts)
+    poly_gps = proj_pts(poly)
+    left_gps = proj_pts(left)
+    right_gps = proj_pts(right)
+    lats = [p[0] for p in poly_gps]
+    lons = [p[1] for p in poly_gps]
+    return {
+        "success": True,
+        "roadName": "Tuyến nhập tọa độ VN-2000",
+        "roadWidth": road_width,
+        "totalLengthMeters": round(total_len, 2),
+        "centralMeridian": cm,
+        "pointCount": n_pts,
+        "bounds": [[round(min(lats), 6), round(min(lons), 6)], [round(max(lats), 6), round(max(lons), 6)]],
+        "centerline": cl_gps,
+        "centerlineBranches": [],
+        "roadSurfacePolygon": poly_gps,
+        "roadSurfacePolygons": [poly_gps],
+        "trafficIslands": [],
+        "layerStats": [],
+        "leftEdge": left_gps,
+        "rightEdge": right_gps,
+    }
+
 def render_dxf_to_png(
     dxf_path_str: str,
     output_size_px: int = 4096,
@@ -1204,6 +1313,10 @@ def main():
     rpp.add_argument("--layer", default=None, help="Force centerline layer")
     rpp.add_argument("--cm", type=float, default=None, help="Custom Central Meridian (e.g. 105.75, 105.5, 105.0)")
     rpp.add_argument("--swap-xy", action="store_true", default=False, help="Force swap coordinates X and Y")
+    cpp = sub.add_parser("parse-coords")
+    cpp.add_argument("dxf_path", help="Path to JSON payload file with the typed coordinates")
+    cpp.add_argument("--width", type=float, default=7.0)
+    cpp.add_argument("--cm", type=float, default=None)
     rp = sub.add_parser("render")
     rp.add_argument("dxf_path")
     rp.add_argument("--size", type=int, default=4096)
@@ -1231,6 +1344,12 @@ def main():
                 target_layer=getattr(args, "layer", None),
                 central_meridian=getattr(args, "cm", None),
                 swap_xy=getattr(args, "swap_xy", False)
+            ), ensure_ascii=False))
+        elif args.command == "parse-coords":
+            print(json.dumps(parse_coords(
+                args.dxf_path,
+                road_width=getattr(args, "width", 7.0),
+                central_meridian=getattr(args, "cm", None)
             ), ensure_ascii=False))
         elif args.command == "render":
             print(json.dumps(render_dxf_to_png(

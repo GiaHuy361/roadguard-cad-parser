@@ -99,5 +99,14 @@ namespace RoadGuard.CadParser.Services.Interfaces
             string? centerlineLayerName = null,
             double? centralMeridian = null,
             CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Builds a road (centerline, surface polygon, edges) from manually typed VN-2000 coordinates.
+        /// </summary>
+        Task<CadParseRoadResponse> ParseCoordsAsync(
+            string coordinatesText,
+            double roadWidth = 7.0,
+            double? centralMeridian = null,
+            CancellationToken cancellationToken = default);
     }
 }

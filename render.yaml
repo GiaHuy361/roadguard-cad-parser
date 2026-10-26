@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: roadguard-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # Comma-separated list of allowed frontend origins, e.g. https://roadguard.onrender.com
+      - key: CORS_ORIGINS
+        sync: false
+      # No ConnectionStrings__Default => database persistence is skipped (parse still works)
