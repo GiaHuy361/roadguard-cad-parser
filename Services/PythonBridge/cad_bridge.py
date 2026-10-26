@@ -71,10 +71,13 @@ LINEAR_TYPES = {"LINE", "LWPOLYLINE", "POLYLINE", "ARC", "SPLINE", "CIRCLE"}
 MIN_CENTERLINE_LENGTH = 10.0
 ARC_TESSELLATION_STEPS = 64
 
-_VN2000_X_MIN =  100_000.0
-_VN2000_X_MAX =  950_000.0
-_VN2000_Y_MIN =  800_000.0
-_VN2000_Y_MAX = 2_600_000.0
+_VN2000_X_MIN =  150_000.0   # Easting (Trục Y trắc địa / Trục X CAD) min (m)
+_VN2000_X_MAX =  900_000.0   # Easting max (m) - covers both 3° and 6° zones
+_VN2000_Y_MIN =  850_000.0   # Northing (Trục X trắc địa / Trục Y CAD) min (m) - covers Cà Mau & southern islands
+_VN2000_Y_MAX = 2_650_000.0  # Northing max (m) - covers northernmost Hà Giang / Lạng Sơn
+
+_AMBIGUOUS_MIN = 800_000.0
+_AMBIGUOUS_MAX = 950_000.0
 
 def _is_vn2000(x, y) -> bool:
     is_std = (_VN2000_X_MIN <= x <= _VN2000_X_MAX and
@@ -87,8 +90,15 @@ def _is_vn2000_swapped(x, y) -> bool:
     return (_VN2000_Y_MIN <= x <= _VN2000_Y_MAX and
             _VN2000_X_MIN <= y <= _VN2000_X_MAX)
 
+def _normalize_scale_factor(k0: float = None) -> float:
+    if k0 is not None and (abs(k0 - 0.9996) < 1e-4 or abs(k0 - 6.0) < 1e-2):
+        return 0.9996
+    if k0 is not None and 0.9990 <= k0 <= 1.0000:
+        return float(k0)
+    return 0.9999
+
 # =============================================================================
-# Projection
+# Projection (VN-2000 <-> WGS-84 per MONRE Circular 973/2001/TT-TCDC)
 # =============================================================================
 
 def detect_central_meridian(x: float, y: float = None) -> float:
@@ -101,9 +111,10 @@ def detect_central_meridian(x: float, y: float = None) -> float:
     else:            return 111.0
 
 
-def make_vn2000_transformer(cm: float):
+def make_vn2000_transformer(cm: float, scale_factor: float = 0.9999):
+    k0 = _normalize_scale_factor(scale_factor)
     proj = (
-        f"+proj=tmerc +lat_0=0 +lon_0={cm} +k=0.9999 "
+        f"+proj=tmerc +lat_0=0 +lon_0={cm} +k={k0} "
         f"+x_0=500000 +y_0=0 +ellps=WGS84 "
         f"+towgs84=-191.90441429,-39.30318279,-111.45032835,"
         f"-0.00928836,0.01975479,-0.00427372,0.252906278 "
@@ -112,21 +123,22 @@ def make_vn2000_transformer(cm: float):
     return Transformer.from_crs(CRS.from_proj4(proj), CRS.from_epsg(4326), always_xy=True)
 
 
-def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = None) -> list:
+def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = None, scale_factor: float = 0.9999) -> list:
     if not points_xy:
         return []
     x0, y0 = points_xy[0]
     if abs(x0) <= 180.0 and abs(y0) <= 90.0 and target_srid == 4326:
-        return [[float(x), float(y)] for x, y in points_xy]
+        return [[round(float(x), 8), round(float(y), 8)] for x, y in points_xy]
     if not HAS_PYPROJ:
         return [_manual_utm(x, y) for x, y in points_xy]
 
     cm = custom_cm if (custom_cm and custom_cm > 0) else detect_central_meridian(x0, y0)
+    k0 = _normalize_scale_factor(scale_factor)
     if target_srid == 4326:
-        tf = make_vn2000_transformer(cm)
+        tf = make_vn2000_transformer(cm, k0)
     else:
         proj_in = (
-            f"+proj=tmerc +lat_0=0 +lon_0={cm} +k=0.9999 "
+            f"+proj=tmerc +lat_0=0 +lon_0={cm} +k={k0} "
             f"+x_0=500000 +y_0=0 +ellps=WGS84 "
             f"+towgs84=-191.90441429,-39.30318279,-111.45032835,"
             f"-0.00928836,0.01975479,-0.00427372,0.252906278 "
@@ -137,11 +149,11 @@ def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = 
         tf = Transformer.from_crs(crs_in, crs_out, always_xy=True)
 
     lons, lats = tf.transform([p[0] for p in points_xy], [p[1] for p in points_xy])
-    return [[float(lon), float(lat)] for lon, lat in zip(lons, lats)]
+    return [[round(float(lon), 8), round(float(lat), 8)] for lon, lat in zip(lons, lats)]
 
 
-def project_to_wgs84(points_xy: list, custom_cm: float = None) -> list:
-    return project_points(points_xy, 4326, custom_cm=custom_cm)
+def project_to_wgs84(points_xy: list, custom_cm: float = None, scale_factor: float = 0.9999) -> list:
+    return project_points(points_xy, 4326, custom_cm=custom_cm, scale_factor=scale_factor)
 
 
 def _manual_utm(easting, northing):
@@ -662,12 +674,48 @@ def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
 # Parse Road Vector & 2D Concrete Surface (GPS WGS-84 Coordinates)
 # =============================================================================
 
-def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = None, central_meridian: float = None, swap_xy: bool = False) -> dict:
+def _shoelace_area(ring: list) -> float:
+    if not ring or len(ring) < 3:
+        return 0.0
+    n = len(ring)
+    area2 = 0.0
+    for i in range(n):
+        x1, y1 = ring[i]
+        x2, y2 = ring[(i + 1) % n]
+        area2 += (x1 * y2 - x2 * y1)
+    return 0.5 * abs(area2)
+
+
+def _build_crs_metadata(cm: float, k0: float, axis_order: str) -> dict:
+    zone_mode = "6deg" if abs(k0 - 0.9996) < 1e-4 else "3deg"
+    return {
+        "sourceDatum": "VN-2000",
+        "targetDatum": "WGS-84 (EPSG:4326)",
+        "centralMeridian": cm,
+        "scaleFactor": k0,
+        "zoneMode": zone_mode,
+        "falseEasting": 500000.0,
+        "falseNorthing": 0.0,
+        "axisOrder": axis_order,
+        "towgs84Parameters": [-191.90441429, -39.30318279, -111.45032835, -0.00928836, 0.01975479, -0.00427372, 0.252906278],
+        "coordinateResolutionDigits": 8,
+        "numericalResolutionMm": 1.1,
+        "geodeticNote": "Chuyển đổi 7 tham số Helmert theo Thông tư 973/2001/TT-TCĐC. Độ phân giải số học đầu ra 1e-8 độ (~1.1 mm); độ chính xác trắc địa thực địa phụ thuộc lưới khống chế khu vực."
+    }
+
+
+def parse_road(
+    dxf_path_str: str,
+    road_width: float = 7.0,
+    target_layer: str = None,
+    central_meridian: float = None,
+    swap_xy: bool = False,
+    scale_factor: float = 0.9999,
+    axis_order: str = "AUTO"
+) -> dict:
     """
-    Extracts the complete road network from CAD (main body, 90-degree curve, bottom horizontal branch,
-    top triangle intersection, and traffic islands).
-    Smoothly tessellates curved bulges (12-24 sample points per curve) and extracts traffic island polygons.
-    Transforms coordinates from VN-2000 to WGS-84 GPS [lat, lon].
+    Extracts the complete road network from CAD (main body, curves, branches, traffic islands).
+    Smoothly tessellates curved bulges and transforms coordinates from VN-2000 to WGS-84 GPS.
     """
     doc = ezdxf.readfile(dxf_path_str)
     msp = doc.modelspace()
@@ -683,7 +731,19 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
             "detail": "Could not identify a centerline layer in the CAD drawing."
         }
 
+    eff_k0 = _normalize_scale_factor(scale_factor)
+    eff_axis = (axis_order or "AUTO").upper()
+    if eff_axis == "VN2000_XY":
+        swap_xy = True
+
     half_w = max(0.5, road_width / 2.0)
+
+    def _normalize_cad_pt(p):
+        if eff_axis == "CAD_EN" and not swap_xy:
+            return (p[0], p[1])
+        if (p[0] > 950_000.0 and p[1] < 900_000.0) or swap_xy:
+            return (p[1], p[0])
+        return (p[0], p[1])
 
     # 1. Collect linear entities directly from modelspace with bulge & arc tessellation
     primary_lines = []
@@ -691,14 +751,11 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         if e.dxf.layer.upper() == chosen_layer.upper():
             pts = entity_to_wcs_points(e)
             if pts and len(pts) >= 2:
-                fixed_pts = []
-                for p in pts:
-                    if (p[0] > 1_000_000.0 and p[1] < 900_000.0) or swap_xy:
-                        fixed_pts.append((p[1], p[0]))
-                    else:
-                        fixed_pts.append((p[0], p[1]))
+                fixed_pts = [_normalize_cad_pt(p) for p in pts]
+                is_deg = abs(fixed_pts[0][0]) <= 180.0 and abs(fixed_pts[0][1]) <= 90.0
+                min_seg_eps = 1e-7 if is_deg else 0.01
                 for i in range(len(fixed_pts) - 1):
-                    if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > 0.01:
+                    if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > min_seg_eps:
                         primary_lines.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
 
     if not primary_lines:
@@ -708,9 +765,12 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                 if lyr.upper() == chosen_layer.upper():
                     pts = entity_to_wcs_points(entity, xform)
                     if pts and len(pts) >= 2:
-                        for i in range(len(pts) - 1):
-                            if math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) > 0.01:
-                                primary_lines.append(LineString([pts[i], pts[i+1]]))
+                        fixed_pts = [_normalize_cad_pt(p) for p in pts]
+                        is_deg = abs(fixed_pts[0][0]) <= 180.0 and abs(fixed_pts[0][1]) <= 90.0
+                        min_seg_eps = 1e-7 if is_deg else 0.01
+                        for i in range(len(fixed_pts) - 1):
+                            if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > min_seg_eps:
+                                primary_lines.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
 
     if not primary_lines:
         return {
@@ -719,7 +779,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
             "detail": f"No linear entities found in layer {chosen_layer}."
         }
 
-    # 2. Extract connected primary corridor (discarding isolated draft splines like Ent 26 in the south)
+    # 2. Extract connected primary corridor
     if HAS_SHAPELY:
         m = linemerge(primary_lines)
         geoms = list(m.geoms) if hasattr(m, 'geoms') else [m]
@@ -740,7 +800,6 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         clean_main = unary_union(main_cluster)
 
         # 3. Collect connected candidate branches from junction layers (DAUTIM, TIMDUONGPHU, TIMPHU)
-        # Note: ONLY linear entities (LINE, LWPOLYLINE, ARC) - NEVER CIRCLE (avoids survey station markers)
         branch_candidates = []
         for e in msp:
             lyr = e.dxf.layer.upper()
@@ -748,12 +807,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                 if any(k in lyr for k in ("DAUTIM", "TIMDUONGPHU", "TIMPHU")):
                     pts = entity_to_wcs_points(e)
                     if pts and len(pts) >= 2:
-                        fixed_pts = []
-                        for p in pts:
-                            if (p[0] > 1_000_000.0 and p[1] < 900_000.0) or swap_xy:
-                                fixed_pts.append((p[1], p[0]))
-                            else:
-                                fixed_pts.append((p[0], p[1]))
+                        fixed_pts = [_normalize_cad_pt(p) for p in pts]
                         for i in range(len(fixed_pts) - 1):
                             if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > 0.01:
                                 branch_candidates.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
@@ -774,25 +828,30 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
             branch_candidates = still_cands
 
         full_net = unary_union(full_cluster)
-        buffered_poly = full_net.buffer(half_w, cap_style='flat', join_style='round')
+        sample_x, sample_y = list(primary_lines[0].coords)[0]
+        is_degree_dxf = abs(sample_x) <= 180.0 and abs(sample_y) <= 90.0
+        buf_dist = (half_w / 111320.0) if is_degree_dxf else half_w
+        buffered_poly = full_net.buffer(buf_dist, cap_style='flat', join_style='round')
         if buffered_poly.geom_type == 'MultiPolygon':
             poly_main = max(buffered_poly.geoms, key=lambda p: p.area)
         else:
             poly_main = buffered_poly
 
         poly_coords = list(poly_main.exterior.coords)
-        tot_len = full_net.length
+        tot_len = full_net.length * (111320.0 if is_degree_dxf else 1.0)
+        surface_area_sqm = round(float(poly_main.area * ((111320.0 ** 2) if is_degree_dxf else 1.0)), 2)
 
         cl_merged = linemerge(full_net) if full_net.geom_type == 'MultiLineString' else full_net
         if hasattr(cl_merged, 'geoms'):
-            raw_branches = [list(g.coords) for g in cl_merged.geoms if g.length > 0.5]
+            min_branch_l = (0.5 / 111320.0) if is_degree_dxf else 0.5
+            raw_branches = [list(g.coords) for g in cl_merged.geoms if g.length > min_branch_l]
         else:
             raw_branches = [list(cl_merged.coords)]
 
-        # Automatically chain connected segments into the longest continuous main road corridor (West to East)
         def chain_longest_corridor(branches):
             def calc_len(pts):
-                return sum(math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) for i in range(len(pts) - 1))
+                raw_l = sum(math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) for i in range(len(pts) - 1))
+                return raw_l * (111320.0 if is_degree_dxf else 1.0)
 
             if not branches:
                 return [], [], 0.0
@@ -859,7 +918,6 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                         best_chain = curr_pts
                         best_indices = set(used)
 
-            # Ensure orientation is West-to-East (start has smaller X coordinate in WCS)
             if best_chain and best_chain[0][0] > best_chain[-1][0]:
                 best_chain = best_chain[::-1]
 
@@ -872,10 +930,9 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
                         b_ls = LineString(b)
                         min_d = main_ls.distance(b_ls)
                         max_d = max(main_ls.distance(LineString([p, p])) for p in b)
-                        if min_d <= 3.0 and max_d >= 8.0:  # genuine fork: touches main but deviates significantly
+                        if min_d <= 3.0 and max_d >= 8.0:
                             genuine_branches.append(b)
 
-                # Deduplicate parallel / duplicate branch lines (e.g. twin curb lines < 2m apart)
                 deduped = []
                 for b in sorted(genuine_branches, key=calc_len, reverse=True):
                     b_ls = LineString(b)
@@ -895,7 +952,6 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         else:
             main_chain = raw_branches[0] if raw_branches else []
 
-        # Traffic islands: only actual traffic island layers (NEVER LE-NGOAI, BO_VIA or VIA which are sidewalk curbs)
         traffic_islands_geom = []
         island_layers = {'DAN_HUONG', 'DAO_TAM_GIAC', 'DAO_GIAO_THONG', 'THGT'}
         min_x, min_y, max_x, max_y = full_net.bounds
@@ -917,6 +973,7 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         poly_coords = list(primary_lines[0].coords)
         main_chain = poly_coords
         tot_len = 0.0
+        surface_area_sqm = 0.0
         raw_branches = [main_chain]
         traffic_islands_geom = []
 
@@ -925,30 +982,34 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
     effective_cm = central_meridian if (central_meridian and central_meridian > 0) else detect_central_meridian(test_pt[0], test_pt[1])
 
     if is_vn and HAS_PYPROJ:
-        tf_custom = make_vn2000_transformer(effective_cm)
+        tf_custom = make_vn2000_transformer(effective_cm, eff_k0)
         def proj_pts(pts):
             lons, lats = tf_custom.transform([p[0] for p in pts], [p[1] for p in pts])
-            return [[round(float(la), 6), round(float(lo), 6)] for lo, la in zip(lons, lats)]
+            return [[round(float(la), 8), round(float(lo), 8)] for lo, la in zip(lons, lats)]
     else:
         def proj_pts(pts):
-            return [[round(float(p[1]), 6), round(float(p[0]), 6)] for p in pts]
+            return [[round(float(p[1]), 8), round(float(p[0]), 8)] for p in pts]
 
     cl_gps = proj_pts(main_chain)
     poly_gps = proj_pts(poly_coords)
     branches_gps = [proj_pts(b) for b in raw_branches]
     islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
 
-    # Combine into roadSurfacePolygons array (main surface + all traffic islands)
     all_surface_polygons = [poly_gps] + islands_gps
 
     all_lats = [p[0] for p in poly_gps]
     all_lons = [p[1] for p in poly_gps]
     bounds = [
-        [round(min(all_lats), 6), round(min(all_lons), 6)],
-        [round(max(all_lats), 6), round(max(all_lons), 6)]
+        [round(min(all_lats), 8), round(min(all_lons), 8)],
+        [round(max(all_lats), 8), round(max(all_lons), 8)]
+    ]
+    bbox = [
+        round(min(all_lons), 8),
+        round(min(all_lats), 8),
+        round(max(all_lons), 8),
+        round(max(all_lats), 8)
     ]
 
-    # Count entities per layer and classify categories
     layer_counts = {}
     for e in msp:
         l = e.dxf.get("layer", "")
@@ -968,14 +1029,24 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         elif "VIA" in u or "LE" in u: cat = "Sidewalk"
         layer_stats.append({"name": l, "count": cnt, "category": cat})
 
+    nominal_area_sqm = round(tot_len * road_width, 2)
+    if surface_area_sqm <= 0:
+        surface_area_sqm = nominal_area_sqm
+
     mid = len(poly_gps) // 2
     return {
         "success": True,
         "roadName": "Tuyến đường hoàn chỉnh (Đầy đủ nhánh & nút giao)",
         "roadWidth": road_width,
         "totalLengthMeters": round(tot_len, 2),
+        "surfaceAreaSqm": surface_area_sqm,
+        "nominalAreaSqm": nominal_area_sqm,
         "centralMeridian": effective_cm,
+        "scaleFactor": eff_k0,
+        "axisOrder": eff_axis,
+        "crsMetadata": _build_crs_metadata(effective_cm, eff_k0, eff_axis),
         "bounds": bounds,
+        "bbox": bbox,
         "centerline": cl_gps,
         "centerlineBranches": branches_gps,
         "roadSurfacePolygon": poly_gps,
@@ -986,49 +1057,122 @@ def parse_road(dxf_path_str: str, road_width: float = 7.0, target_layer: str = N
         "rightEdge": poly_gps[mid:]
     }
 
-def parse_coords(payload_path: str, road_width: float = 7.0, central_meridian: float = None) -> dict:
+
+def parse_coords(
+    payload_path: str,
+    road_width: float = 7.0,
+    central_meridian: float = None,
+    scale_factor: float = None,
+    axis_order: str = None
+) -> dict:
     """
     Builds a road (centerline, surface polygon, edges) from manually typed VN-2000 points.
-    Input file is JSON: {"text": "<one 'N, E' or 'E, N' pair per line>"}.
-    Axis order is auto-detected per point (Northing ~1.0-2.6M, Easting ~0.1-0.95M).
-    Output has the same shape as parse_road (GPS values are [lat, lon]).
+    Supports:
+      - scaleFactor: 0.9999 (3° zone, default) or 0.9996 (6° zone)
+      - axisOrder: 'VN2000_XY' (X=North, Y=East), 'CAD_EN' (E=East, N=North), or 'AUTO' (with confidence check)
+      - centralMeridian: custom central meridian in decimal degrees
+    Output has the same shape as parse_road (GPS values are [lat, lon] rounded to 8 decimal places).
     """
     import re
     with open(payload_path, "r", encoding="utf-8-sig") as fh:
         payload = json.load(fh)
     text = payload.get("text", "") if isinstance(payload, dict) else ""
 
+    payload_k0 = payload.get("scaleFactor") if isinstance(payload, dict) else None
+    payload_axis = payload.get("axisOrder") if isinstance(payload, dict) else None
+    payload_cm = payload.get("centralMeridian") if isinstance(payload, dict) else None
+
+    eff_k0 = _normalize_scale_factor(scale_factor if scale_factor is not None else payload_k0)
+    eff_axis = str(axis_order or payload_axis or "AUTO").strip().upper()
+    if eff_axis not in ("AUTO", "VN2000_XY", "CAD_EN"):
+        eff_axis = "AUTO"
+    eff_cm_arg = central_meridian if (central_meridian and central_meridian > 0) else (
+        float(payload_cm) if (payload_cm and float(payload_cm) > 0) else None
+    )
+
     pts = []          # normalized (easting, northing) in metres
     bad_lines = []
+    ambiguous_lines = []
+    detected_orders = set()
+
     for ln_no, line in enumerate(str(text).splitlines(), start=1):
         line = line.strip()
-        if not line:
+        if not line or line.startswith("#"):
             continue
+        # Ignore header lines in CSV (e.g. "STT, X, Y" or "Station, Northing, Easting")
+        if re.search(r"[A-Za-zÀ-ỹ]", line) and not re.match(r"^\s*(?:Km|Cọc|Coc|P|Mốc|Moc)?\s*\d", line, re.IGNORECASE):
+            nums_check = re.findall(r"-?\d+(?:\.\d+)?", line)
+            if len(nums_check) < 2:
+                continue
+
         nums = re.findall(r"-?\d+(?:\.\d+)?", line.replace(";", " "))
         if len(nums) < 2:
             bad_lines.append(ln_no)
             continue
-        a, b = float(nums[0]), float(nums[1])
-        if a > 1_000_000.0 and b < 1_000_000.0:      # "Northing, Easting" (VN-2000 convention)
-            e, n = b, a
-        elif b > 1_000_000.0 and a < 1_000_000.0:    # "Easting, Northing"
-            e, n = a, b
+
+        # If a line has 3+ numbers and the first number is a small integer index (1, 2, 3... < 10000),
+        # take the coordinate pair from nums[1], nums[2]
+        if len(nums) >= 3 and abs(float(nums[0])) < 10000.0 and abs(float(nums[1])) >= 100000.0 and abs(float(nums[2])) >= 100000.0:
+            a, b = float(nums[1]), float(nums[2])
         else:
-            bad_lines.append(ln_no)
-            continue
-        if not _is_vn2000(e, n):
-            bad_lines.append(ln_no)
-            continue
+            a, b = float(nums[0]), float(nums[1])
+
+        if eff_axis == "VN2000_XY":
+            n, e = a, b
+            if not (_VN2000_Y_MIN <= n <= _VN2000_Y_MAX and _VN2000_X_MIN <= e <= _VN2000_X_MAX):
+                bad_lines.append(ln_no)
+                continue
+        elif eff_axis == "CAD_EN":
+            e, n = a, b
+            if not (_VN2000_X_MIN <= e <= _VN2000_X_MAX and _VN2000_Y_MIN <= n <= _VN2000_Y_MAX):
+                bad_lines.append(ln_no)
+                continue
+        else:
+            # AUTO mode with strict confidence check
+            valid_ne = (_VN2000_Y_MIN <= a <= _VN2000_Y_MAX) and (_VN2000_X_MIN <= b <= _VN2000_X_MAX)
+            valid_en = (_VN2000_X_MIN <= a <= _VN2000_X_MAX) and (_VN2000_Y_MIN <= b <= _VN2000_Y_MAX)
+            both_in_overlap = (_AMBIGUOUS_MIN <= a <= _AMBIGUOUS_MAX) and (_AMBIGUOUS_MIN <= b <= _AMBIGUOUS_MAX)
+
+            if both_in_overlap or (valid_ne and valid_en):
+                ambiguous_lines.append(ln_no)
+                continue
+            elif valid_ne:
+                e, n = b, a
+                detected_orders.add("VN2000_XY")
+            elif valid_en:
+                e, n = a, b
+                detected_orders.add("CAD_EN")
+            else:
+                bad_lines.append(ln_no)
+                continue
+
         if pts and math.hypot(e - pts[-1][0], n - pts[-1][1]) < 0.01:
-            continue                                  # drop duplicate consecutive points
+            continue
         pts.append((e, n))
 
+    if ambiguous_lines or len(detected_orders) > 1:
+        line_info = f" tại dòng {', '.join(map(str, ambiguous_lines[:10]))}" if ambiguous_lines else " do thứ tự cột không đồng nhất giữa các dòng"
+        return {
+            "success": False,
+            "error": "AmbiguousAxisOrder",
+            "requiresAxisConfirmation": True,
+            "detail": f"Không đủ độ tin cậy để tự động nhận diện trục tọa độ{line_info} (vùng giao thoa 800,000 – 950,000 m). Vui lòng chọn rõ quy ước trục: 'X (Bắc), Y (Đông)' hoặc 'X (Đông), Y (Bắc)'."
+        }
+
     if bad_lines:
-        return {"success": False, "error": "InvalidCoordinates",
-                "detail": f"Dòng không hợp lệ (không phải tọa độ VN-2000): {', '.join(map(str, bad_lines[:10]))}"}
+        return {
+            "success": False,
+            "error": "InvalidCoordinates",
+            "detail": f"Dòng không hợp lệ (ngoài phạm vi tọa độ VN-2000: X_Bắc [850,000..2,650,000m], Y_Đông [150,000..900,000m]): {', '.join(map(str, bad_lines[:10]))}"
+        }
     if len(pts) < 2:
-        return {"success": False, "error": "NotEnoughPoints",
-                "detail": "Cần ít nhất 2 điểm tọa độ VN-2000 khác nhau."}
+        return {
+            "success": False,
+            "error": "NotEnoughPoints",
+            "detail": "Cần ít nhất 2 điểm tọa độ VN-2000 khác nhau."
+        }
+
+    resolved_axis = eff_axis if eff_axis != "AUTO" else (next(iter(detected_orders)) if detected_orders else "VN2000_XY")
 
     # Ribbon with miter correction at each vertex
     half_w = max(0.5, road_width / 2.0)
@@ -1060,16 +1204,18 @@ def parse_coords(payload_path: str, road_width: float = 7.0, central_meridian: f
     poly.append(poly[0])
 
     total_len = sum(math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) for i in range(n_pts - 1))
+    surface_area_sqm = round(_shoelace_area(poly), 2)
+    nominal_area_sqm = round(total_len * road_width, 2)
 
-    cm = central_meridian if (central_meridian and central_meridian > 0) else detect_central_meridian(pts[0][0], pts[0][1])
+    cm = eff_cm_arg if eff_cm_arg else detect_central_meridian(pts[0][0], pts[0][1])
     if HAS_PYPROJ:
-        tf = make_vn2000_transformer(cm)
+        tf = make_vn2000_transformer(cm, eff_k0)
         def proj_pts(arr):
             lons, lats = tf.transform([p[0] for p in arr], [p[1] for p in arr])
-            return [[round(float(la), 6), round(float(lo), 6)] for lo, la in zip(lons, lats)]
+            return [[round(float(la), 8), round(float(lo), 8)] for lo, la in zip(lons, lats)]
     else:
         def proj_pts(arr):
-            return [[round(float(v[1]), 6), round(float(v[0]), 6)] for v in (_manual_utm(p[0], p[1]) for p in arr)]
+            return [[round(float(v[1]), 8), round(float(v[0]), 8)] for v in (_manual_utm(p[0], p[1]) for p in arr)]
 
     cl_gps = proj_pts(pts)
     poly_gps = proj_pts(poly)
@@ -1077,14 +1223,23 @@ def parse_coords(payload_path: str, road_width: float = 7.0, central_meridian: f
     right_gps = proj_pts(right)
     lats = [p[0] for p in poly_gps]
     lons = [p[1] for p in poly_gps]
+    bounds = [[round(min(lats), 8), round(min(lons), 8)], [round(max(lats), 8), round(max(lons), 8)]]
+    bbox = [round(min(lons), 8), round(min(lats), 8), round(max(lons), 8), round(max(lats), 8)]
+
     return {
         "success": True,
         "roadName": "Tuyến nhập tọa độ VN-2000",
         "roadWidth": road_width,
         "totalLengthMeters": round(total_len, 2),
+        "surfaceAreaSqm": surface_area_sqm,
+        "nominalAreaSqm": nominal_area_sqm,
         "centralMeridian": cm,
+        "scaleFactor": eff_k0,
+        "axisOrder": resolved_axis,
+        "crsMetadata": _build_crs_metadata(cm, eff_k0, resolved_axis),
         "pointCount": n_pts,
-        "bounds": [[round(min(lats), 6), round(min(lons), 6)], [round(max(lats), 6), round(max(lons), 6)]],
+        "bounds": bounds,
+        "bbox": bbox,
         "centerline": cl_gps,
         "centerlineBranches": [],
         "roadSurfacePolygon": poly_gps,
@@ -1297,7 +1452,7 @@ def render_dxf_to_png(
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="RoadGuard CAD ezdxf Bridge v2.3")
+    parser = argparse.ArgumentParser(description="RoadGuard CAD ezdxf Bridge v2.4")
     sub = parser.add_subparsers(dest="command")
 
     lp = sub.add_parser("get-layers"); lp.add_argument("dxf_path")
@@ -1306,17 +1461,24 @@ def main():
     pp.add_argument("dxf_path"); pp.add_argument("--layer", default=None)
     pp.add_argument("--srid", type=int, default=4326)
     pp.add_argument("--cm", type=float, default=None, help="Custom Central Meridian")
+    pp.add_argument("--k0", type=float, default=0.9999, help="Scale factor (0.9999 for 3deg, 0.9996 for 6deg)")
 
     rpp = sub.add_parser("parse-road")
     rpp.add_argument("dxf_path")
     rpp.add_argument("--width", type=float, default=7.0, help="Road width in meters")
     rpp.add_argument("--layer", default=None, help="Force centerline layer")
     rpp.add_argument("--cm", type=float, default=None, help="Custom Central Meridian (e.g. 105.75, 105.5, 105.0)")
+    rpp.add_argument("--k0", type=float, default=0.9999, help="Scale factor (0.9999 for 3deg, 0.9996 for 6deg)")
+    rpp.add_argument("--axis-order", default="AUTO", help="Axis order: AUTO, VN2000_XY, CAD_EN")
     rpp.add_argument("--swap-xy", action="store_true", default=False, help="Force swap coordinates X and Y")
+
     cpp = sub.add_parser("parse-coords")
     cpp.add_argument("dxf_path", help="Path to JSON payload file with the typed coordinates")
     cpp.add_argument("--width", type=float, default=7.0)
     cpp.add_argument("--cm", type=float, default=None)
+    cpp.add_argument("--k0", type=float, default=None)
+    cpp.add_argument("--axis-order", default=None)
+
     rp = sub.add_parser("render")
     rp.add_argument("dxf_path")
     rp.add_argument("--size", type=int, default=4096)
@@ -1343,13 +1505,17 @@ def main():
                 road_width=getattr(args, "width", 7.0),
                 target_layer=getattr(args, "layer", None),
                 central_meridian=getattr(args, "cm", None),
-                swap_xy=getattr(args, "swap_xy", False)
+                swap_xy=getattr(args, "swap_xy", False),
+                scale_factor=getattr(args, "k0", 0.9999),
+                axis_order=getattr(args, "axis_order", "AUTO")
             ), ensure_ascii=False))
         elif args.command == "parse-coords":
             print(json.dumps(parse_coords(
                 args.dxf_path,
                 road_width=getattr(args, "width", 7.0),
-                central_meridian=getattr(args, "cm", None)
+                central_meridian=getattr(args, "cm", None),
+                scale_factor=getattr(args, "k0", None),
+                axis_order=getattr(args, "axis_order", None)
             ), ensure_ascii=False))
         elif args.command == "render":
             print(json.dumps(render_dxf_to_png(

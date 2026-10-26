@@ -376,6 +376,8 @@ namespace RoadGuard.CadParser.Controllers
                     request.RoadWidth > 0 ? request.RoadWidth : 7.0,
                     request.CenterlineLayerName,
                     request.CentralMeridian,
+                    request.ScaleFactor,
+                    request.AxisOrder,
                     cancellationToken).ConfigureAwait(false);
 
                 if (!result.Success)
@@ -435,6 +437,8 @@ namespace RoadGuard.CadParser.Controllers
                     request.Coordinates,
                     request.RoadWidth > 0 ? request.RoadWidth : 7.0,
                     request.CentralMeridian,
+                    request.ScaleFactor,
+                    request.AxisOrder,
                     cancellationToken).ConfigureAwait(false);
 
                 if (!result.Success)

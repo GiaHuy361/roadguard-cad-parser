@@ -170,6 +170,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             double roadWidth = 7.0,
             string? centerlineLayerName = null,
             double? centralMeridian = null,
+            double? scaleFactor = null,
+            string? axisOrder = null,
             CancellationToken cancellationToken = default)
         {
             ValidateFile(file);
@@ -182,14 +184,23 @@ namespace RoadGuard.CadParser.Services.Implementations
                     await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
                 }
 
-                var bridgeArgs = $"parse-road \"{tempFile}\" --width {roadWidth}";
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                var bridgeArgs = $"parse-road \"{tempFile}\" --width {roadWidth.ToString(inv)}";
                 if (!string.IsNullOrWhiteSpace(centerlineLayerName))
                 {
                     bridgeArgs += $" --layer \"{centerlineLayerName}\"";
                 }
                 if (centralMeridian.HasValue && centralMeridian.Value > 0)
                 {
-                    bridgeArgs += $" --cm {centralMeridian.Value}";
+                    bridgeArgs += $" --cm {centralMeridian.Value.ToString(inv)}";
+                }
+                if (scaleFactor.HasValue && scaleFactor.Value > 0)
+                {
+                    bridgeArgs += $" --k0 {scaleFactor.Value.ToString(inv)}";
+                }
+                if (!string.IsNullOrWhiteSpace(axisOrder))
+                {
+                    bridgeArgs += $" --axis-order \"{axisOrder.Trim()}\"";
                 }
 
                 var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
@@ -221,6 +232,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             string coordinatesText,
             double roadWidth = 7.0,
             double? centralMeridian = null,
+            double? scaleFactor = null,
+            string? axisOrder = null,
             CancellationToken cancellationToken = default)
         {
             if (string.IsNullOrWhiteSpace(coordinatesText))
@@ -236,7 +249,13 @@ namespace RoadGuard.CadParser.Services.Implementations
             var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.json");
             try
             {
-                var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new { text = coordinatesText });
+                var payload = Newtonsoft.Json.JsonConvert.SerializeObject(new
+                {
+                    text = coordinatesText,
+                    scaleFactor = scaleFactor,
+                    axisOrder = axisOrder,
+                    centralMeridian = centralMeridian
+                });
                 await File.WriteAllTextAsync(tempFile, payload, new System.Text.UTF8Encoding(false), cancellationToken).ConfigureAwait(false);
 
                 var inv = System.Globalization.CultureInfo.InvariantCulture;
@@ -244,6 +263,14 @@ namespace RoadGuard.CadParser.Services.Implementations
                 if (centralMeridian.HasValue && centralMeridian.Value > 0)
                 {
                     bridgeArgs += $" --cm {centralMeridian.Value.ToString(inv)}";
+                }
+                if (scaleFactor.HasValue && scaleFactor.Value > 0)
+                {
+                    bridgeArgs += $" --k0 {scaleFactor.Value.ToString(inv)}";
+                }
+                if (!string.IsNullOrWhiteSpace(axisOrder))
+                {
+                    bridgeArgs += $" --axis-order \"{axisOrder.Trim()}\"";
                 }
 
                 var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);

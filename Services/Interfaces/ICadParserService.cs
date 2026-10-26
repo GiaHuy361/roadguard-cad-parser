@@ -98,6 +98,8 @@ namespace RoadGuard.CadParser.Services.Interfaces
             double roadWidth = 7.0,
             string? centerlineLayerName = null,
             double? centralMeridian = null,
+            double? scaleFactor = null,
+            string? axisOrder = null,
             CancellationToken cancellationToken = default);
 
         /// <summary>
@@ -107,6 +109,8 @@ namespace RoadGuard.CadParser.Services.Interfaces
             string coordinatesText,
             double roadWidth = 7.0,
             double? centralMeridian = null,
+            double? scaleFactor = null,
+            string? axisOrder = null,
             CancellationToken cancellationToken = default);
     }
 }

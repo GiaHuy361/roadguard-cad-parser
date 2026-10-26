@@ -11,14 +11,18 @@ namespace RoadGuard.CadParser.DTOs
         public double RoadWidth { get; set; } = 7.0;
         public string? CenterlineLayerName { get; set; }
         public double? CentralMeridian { get; set; }
+        public double? ScaleFactor { get; set; }
+        public string? AxisOrder { get; set; }
     }
 
     public sealed class CadParseCoordsRequest
     {
-        /// <summary>One VN-2000 point per line, e.g. "1199145.22, 614235.15" (Northing, Easting; order auto-detected).</summary>
+        /// <summary>One VN-2000 point per line, e.g. "1199145.22, 614235.15" (Northing, Easting; order configurable or auto-detected).</summary>
         public string Coordinates { get; set; } = string.Empty;
         public double RoadWidth { get; set; } = 7.0;
         public double? CentralMeridian { get; set; }
+        public double? ScaleFactor { get; set; }
+        public string? AxisOrder { get; set; }
     }
 
     public sealed class CadParseRoadResponse
@@ -29,7 +33,7 @@ namespace RoadGuard.CadParser.DTOs
 
         [JsonProperty("roadName")]
         [JsonPropertyName("roadName")]
-        public string RoadName { get; set; } = "Tuy?n ???ng ch?nh";
+        public string RoadName { get; set; } = "Tuyến đường chính";
 
         [JsonProperty("roadWidth")]
         [JsonPropertyName("roadWidth")]
@@ -39,13 +43,37 @@ namespace RoadGuard.CadParser.DTOs
         [JsonPropertyName("totalLengthMeters")]
         public double TotalLengthMeters { get; set; }
 
+        [JsonProperty("surfaceAreaSqm")]
+        [JsonPropertyName("surfaceAreaSqm")]
+        public double? SurfaceAreaSqm { get; set; }
+
+        [JsonProperty("nominalAreaSqm")]
+        [JsonPropertyName("nominalAreaSqm")]
+        public double? NominalAreaSqm { get; set; }
+
         [JsonProperty("centralMeridian")]
         [JsonPropertyName("centralMeridian")]
         public double? CentralMeridian { get; set; }
 
+        [JsonProperty("scaleFactor")]
+        [JsonPropertyName("scaleFactor")]
+        public double? ScaleFactor { get; set; }
+
+        [JsonProperty("axisOrder")]
+        [JsonPropertyName("axisOrder")]
+        public string? AxisOrder { get; set; }
+
+        [JsonProperty("crsMetadata")]
+        [JsonPropertyName("crsMetadata")]
+        public Dictionary<string, object>? CrsMetadata { get; set; }
+
         [JsonProperty("bounds")]
         [JsonPropertyName("bounds")]
         public List<List<double>> Bounds { get; set; } = new();
+
+        [JsonProperty("bbox")]
+        [JsonPropertyName("bbox")]
+        public List<double>? Bbox { get; set; }
 
         [JsonProperty("centerline")]
         [JsonPropertyName("centerline")]
@@ -78,6 +106,10 @@ namespace RoadGuard.CadParser.DTOs
         [JsonProperty("layerStats")]
         [JsonPropertyName("layerStats")]
         public List<CadLayerStatItem>? LayerStats { get; set; }
+
+        [JsonProperty("requiresAxisConfirmation")]
+        [JsonPropertyName("requiresAxisConfirmation")]
+        public bool? RequiresAxisConfirmation { get; set; }
 
         [JsonProperty("error")]
         [JsonPropertyName("error")]
