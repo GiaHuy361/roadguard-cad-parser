@@ -439,12 +439,25 @@ namespace RoadGuard.CadParser.Services.Implementations
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Python bridge parse failed or threw exception; attempting netDxf fallback.");
+                    var msg = ex.Message;
+                    if (msg.Contains("pyproj", StringComparison.OrdinalIgnoreCase) ||
+                        msg.Contains("ScaleFactor", StringComparison.OrdinalIgnoreCase) ||
+                        msg.Contains("CRS", StringComparison.OrdinalIgnoreCase) ||
+                        msg.Contains("projection", StringComparison.OrdinalIgnoreCase) ||
+                        msg.Contains("geodetic", StringComparison.OrdinalIgnoreCase) ||
+                        msg.Contains("Hệ số co giãn", StringComparison.OrdinalIgnoreCase) ||
+                        msg.Contains("InvalidScaleFactor", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _logger.LogError(ex, "Python bridge geodetic/CRS operation failed. Fail-closed: refusing netDxf fallback.");
+                        throw;
+                    }
+
+                    _logger.LogWarning(ex, "Python bridge parse failed or threw exception; attempting netDxf fallback for local CAD only.");
                 }
 
                 if (pyParseResult is not null)
                 {
-                    if (!pyParseResult.Success)
+                    if (!pyParseResult.Success || !string.IsNullOrEmpty(pyParseResult.Error))
                     {
                         throw new InvalidOperationException(
                             pyParseResult.Detail ?? pyParseResult.Error ?? "CAD parsing failed in Python bridge.");
@@ -538,7 +551,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                         }
                     }
 
-                    double totalMeters  = srid == 4326 ? rawLen * MetersPerDegree : rawLen;
+                    // In netDxf fallback, coordinates are strictly local CAD planar units; never multiply by MetersPerDegree
+                    double totalMeters  = rawLen;
                     double totalAreaSqm = Math.Round(totalMeters * roadWidth, 2);
                     int estimatedSlabs  = (int)Math.Ceiling(totalMeters / slabLength);
                     int roadSegments    = stations.Count > 0 ? stations.Count : (int)Math.Ceiling(totalMeters / segmentLength);
@@ -623,8 +637,23 @@ namespace RoadGuard.CadParser.Services.Implementations
                     var warns   = new List<string>();
                     var byLayer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
+                    // Step 2.5: Fail-closed guard for georeferenced requests
+                    if (srid == 4326 && (centralMeridian.HasValue || scaleFactor.HasValue || !string.IsNullOrWhiteSpace(axisOrder)))
+                    {
+                        throw new InvalidOperationException(
+                            "Không thể định vị GIS WGS-84/VN-2000 bằng bộ phân tích dự phòng netDxf do thiếu thư viện trắc địa Python Bridge. Yêu cầu Python Bridge để chuyển đổi tọa độ VN-2000.");
+                    }
+
+                    warns.Add("Bản vẽ được nạp bằng bộ phân tích dự phòng netDxf ở chế độ tọa độ phẳng cục bộ (Local CAD 2D) không có định vị GIS quốc gia VN-2000.");
+
                     // Step 3: Complex entities (Arc, Spline, Polyline with bulges)
                     ProcessAllEntities(dxfDoc, feats, warns, byLayer, tessellationSegments, srid, centerlineLayerName);
+
+                    foreach (var f in feats)
+                    {
+                        f.Properties["isGeoreferenced"] = false;
+                        f.Properties["crsState"] = "LOCAL_CAD_NON_GEOREFERENCED";
+                    }
 
                     // Step 2: Physical stationing points via Linear Referencing
                     var stations = GenerateStationPoints(feats, byLayer, segmentLength, srid, centerlineLayerName);
