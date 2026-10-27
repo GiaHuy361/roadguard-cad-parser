@@ -69,7 +69,7 @@ namespace RoadGuard.CadParser.DTOs
 
         [JsonProperty("bounds")]
         [JsonPropertyName("bounds")]
-        public List<List<double>> Bounds { get; set; } = new();
+        public List<List<double>>? Bounds { get; set; } = new();
 
         [JsonProperty("bbox")]
         [JsonPropertyName("bbox")]
@@ -107,6 +107,34 @@ namespace RoadGuard.CadParser.DTOs
         [JsonPropertyName("layerStats")]
         public List<CadLayerStatItem>? LayerStats { get; set; }
 
+        [JsonProperty("isGeoreferenced")]
+        [JsonPropertyName("isGeoreferenced")]
+        public bool? IsGeoreferenced { get; set; } = true;
+
+        [JsonProperty("crsState")]
+        [JsonPropertyName("crsState")]
+        public string? CrsState { get; set; }
+
+        [JsonProperty("notice")]
+        [JsonPropertyName("notice")]
+        public string? Notice { get; set; }
+
+        [JsonProperty("candidateLayers")]
+        [JsonPropertyName("candidateLayers")]
+        public List<CadCandidateLayerItem>? CandidateLayers { get; set; }
+
+        [JsonProperty("centerlineCad")]
+        [JsonPropertyName("centerlineCad")]
+        public List<List<double>>? CenterlineCad { get; set; }
+
+        [JsonProperty("centerlineBranchesCad")]
+        [JsonPropertyName("centerlineBranchesCad")]
+        public List<List<List<double>>>? CenterlineBranchesCad { get; set; }
+
+        [JsonProperty("roadSurfacePolygonCad")]
+        [JsonPropertyName("roadSurfacePolygonCad")]
+        public List<List<double>>? RoadSurfacePolygonCad { get; set; }
+
         [JsonProperty("requiresAxisConfirmation")]
         [JsonPropertyName("requiresAxisConfirmation")]
         public bool? RequiresAxisConfirmation { get; set; }
@@ -118,6 +146,33 @@ namespace RoadGuard.CadParser.DTOs
         [JsonProperty("detail")]
         [JsonPropertyName("detail")]
         public string? Detail { get; set; }
+    }
+
+    public sealed class CadCandidateLayerItem
+    {
+        [JsonProperty("name")]
+        [JsonPropertyName("name")]
+        public string Name { get; set; } = string.Empty;
+
+        [JsonProperty("score")]
+        [JsonPropertyName("score")]
+        public double Score { get; set; }
+
+        [JsonProperty("totalLengthMeters")]
+        [JsonPropertyName("totalLengthMeters")]
+        public double TotalLengthMeters { get; set; }
+
+        [JsonProperty("entityCount")]
+        [JsonPropertyName("entityCount")]
+        public int EntityCount { get; set; }
+
+        [JsonProperty("isRecommended")]
+        [JsonPropertyName("isRecommended")]
+        public bool IsRecommended { get; set; }
+
+        [JsonProperty("isSelected")]
+        [JsonPropertyName("isSelected")]
+        public bool IsSelected { get; set; }
     }
 
     public sealed class CadLayerStatItem

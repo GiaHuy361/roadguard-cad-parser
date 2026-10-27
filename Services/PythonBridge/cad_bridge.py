@@ -90,6 +90,51 @@ def _is_vn2000_swapped(x, y) -> bool:
     return (_VN2000_Y_MIN <= x <= _VN2000_Y_MAX and
             _VN2000_X_MIN <= y <= _VN2000_X_MAX)
 
+def _classify_coordinate_system(pts):
+    """
+    Classifies points into:
+    - 'GEOREFERENCED_VN2000': coordinates in VN-2000 bounds
+    - 'GEOREFERENCED_WGS84': coordinates in degrees (Vietnam lon 100-115, lat 8-25)
+    - 'LOCAL_CAD_NON_GEOREFERENCED': CAD local coordinates (origin near 0, negative values, < 100k, or > 3M)
+    Returns: (classification_str, is_swapped_bool)
+    """
+    if not pts:
+        return 'LOCAL_CAD_NON_GEOREFERENCED', False
+    
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    # 1. WGS-84 in degrees
+    if (100.0 <= min_x <= 115.0 and 100.0 <= max_x <= 115.0 and
+        8.0 <= min_y <= 25.0 and 8.0 <= max_y <= 25.0):
+        return 'GEOREFERENCED_WGS84', False
+    if (100.0 <= min_y <= 115.0 and 100.0 <= max_y <= 115.0 and
+        8.0 <= min_x <= 25.0 and 8.0 <= max_x <= 25.0):
+        return 'GEOREFERENCED_WGS84', True
+
+    # 2. VN-2000 metric coordinates
+    is_std = (200_000.0 <= min_x and max_x <= 850_000.0 and
+              900_000.0 <= min_y and max_y <= 2_600_000.0)
+    is_swp = (900_000.0 <= min_x and max_x <= 2_600_000.0 and
+              200_000.0 <= min_y and max_y <= 850_000.0)
+
+    if is_std:
+        return 'GEOREFERENCED_VN2000', False
+    if is_swp:
+        return 'GEOREFERENCED_VN2000', True
+
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    if min_x > 0 and min_y > 0:
+        if (200_000.0 <= mean_x <= 850_000.0 and 900_000.0 <= mean_y <= 2_600_000.0):
+            return 'GEOREFERENCED_VN2000', False
+        if (900_000.0 <= mean_x <= 2_600_000.0 and 200_000.0 <= mean_y <= 850_000.0):
+            return 'GEOREFERENCED_VN2000', True
+
+    return 'LOCAL_CAD_NON_GEOREFERENCED', False
+
 def _normalize_scale_factor(k0: float = None) -> float:
     if k0 is not None and (abs(k0 - 0.9996) < 1e-4 or abs(k0 - 6.0) < 1e-2):
         return 0.9996
@@ -438,12 +483,39 @@ def _detect_centerline_layer(msp, doc):
             final_score = sc * length_factor + min(500.0, total * 0.5)
             scored_layers[l] = (final_score, total)
             
+    candidate_layers = []
+    for l, segs in layer_raw.items():
+        sc = score_centerline_layer(l)
+        total = sum(math.hypot(seg[i][0] - seg[i - 1][0], seg[i][1] - seg[i - 1][1])
+                    for seg in segs for i in range(1, len(seg)))
+        if total < 0.5:
+            continue
+        length_factor = min(1.0, total / 300.0)
+        final_score = (sc * length_factor + min(500.0, total * 0.5)) if sc > 0 else (min(100.0, total * 0.1))
+        candidate_layers.append({
+            "name": l,
+            "score": round(final_score, 1),
+            "totalLengthMeters": round(total, 2),
+            "entityCount": len(segs),
+            "isRecommended": False,
+            "isSelected": False
+        })
+
+    candidate_layers.sort(key=lambda x: (x["score"], x["totalLengthMeters"]), reverse=True)
+    best_layer = None
     if scored_layers:
         best_layer = max(scored_layers, key=lambda l: (scored_layers[l][0], scored_layers[l][1]))
-        return best_layer, layer_raw
-    if layer_raw:
-        return max(layer_raw, key=lambda l: len(layer_raw[l])), layer_raw
-    return None, layer_raw
+    elif candidate_layers:
+        best_layer = candidate_layers[0]["name"]
+    elif layer_raw:
+        best_layer = max(layer_raw, key=lambda l: len(layer_raw[l]))
+
+    for c in candidate_layers:
+        if c["name"] == best_layer:
+            c["isRecommended"] = True
+            break
+
+    return best_layer, layer_raw, candidate_layers[:25]
 
 # =============================================================================
 # Extract geometry (RFC 7946 GeoJSON FeatureCollection output)
@@ -483,10 +555,10 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
                     chosen_layer = l
                     break
         if not chosen_layer:
-            auto, _ = _detect_centerline_layer(msp, doc)
+            auto, _, _ = _detect_centerline_layer(msp, doc)
             chosen_layer = auto
     else:
-        auto, _ = _detect_centerline_layer(msp, doc)
+        auto, _, _ = _detect_centerline_layer(msp, doc)
         chosen_layer = auto
 
     if not chosen_layer:
@@ -766,9 +838,10 @@ def parse_road(
     doc = ezdxf.readfile(dxf_path_str)
     msp = doc.modelspace()
 
-    chosen_layer = target_layer
-    if not chosen_layer:
-        chosen_layer, _ = _detect_centerline_layer(msp, doc)
+    best_layer, _, candidate_layers = _detect_centerline_layer(msp, doc)
+    chosen_layer = target_layer if target_layer else best_layer
+    for c in candidate_layers:
+        c["isSelected"] = (c["name"] == chosen_layer)
 
     if not chosen_layer:
         return {
@@ -1024,37 +1097,79 @@ def parse_road(
         traffic_islands_geom = []
 
     test_pt = main_chain[0]
-    is_vn = _is_vn2000(test_pt[0], test_pt[1])
+    coord_state, is_swapped_detected = _classify_coordinate_system(main_chain)
     effective_cm = central_meridian if (central_meridian and central_meridian > 0) else detect_central_meridian(test_pt[0], test_pt[1])
 
-    if is_vn and HAS_PYPROJ:
+    if coord_state == "GEOREFERENCED_VN2000" and HAS_PYPROJ:
         tf_custom = make_vn2000_transformer(effective_cm, eff_k0)
         def proj_pts(pts):
             lons, lats = tf_custom.transform([p[0] for p in pts], [p[1] for p in pts])
             return [[round(float(la), 8), round(float(lo), 8)] for lo, la in zip(lons, lats)]
-    else:
+
+        cl_gps = proj_pts(main_chain)
+        poly_gps = proj_pts(poly_coords)
+        branches_gps = [proj_pts(b) for b in raw_branches]
+        islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
+        all_surface_polygons = [poly_gps] + islands_gps
+
+        all_lats = [p[0] for p in poly_gps]
+        all_lons = [p[1] for p in poly_gps]
+        bounds = [
+            [round(min(all_lats), 8), round(min(all_lons), 8)],
+            [round(max(all_lats), 8), round(max(all_lons), 8)]
+        ]
+        bbox = [
+            round(min(all_lons), 8),
+            round(min(all_lats), 8),
+            round(max(all_lons), 8),
+            round(max(all_lats), 8)
+        ]
+        is_georeferenced = True
+        crs_state = "AMBIGUOUS_VN2000" if (eff_axis == "AUTO" and is_swapped_detected) else "GEOREFERENCED_VN2000"
+        notice = None
+
+    elif coord_state == "GEOREFERENCED_WGS84":
         def proj_pts(pts):
-            return [[round(float(p[1]), 8), round(float(p[0]), 8)] for p in pts]
+            if is_swapped_detected:
+                return [[round(float(p[0]), 8), round(float(p[1]), 8)] for p in pts]
+            else:
+                return [[round(float(p[1]), 8), round(float(p[0]), 8)] for p in pts]
 
-    cl_gps = proj_pts(main_chain)
-    poly_gps = proj_pts(poly_coords)
-    branches_gps = [proj_pts(b) for b in raw_branches]
-    islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
+        cl_gps = proj_pts(main_chain)
+        poly_gps = proj_pts(poly_coords)
+        branches_gps = [proj_pts(b) for b in raw_branches]
+        islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
+        all_surface_polygons = [poly_gps] + islands_gps
 
-    all_surface_polygons = [poly_gps] + islands_gps
+        all_lats = [p[0] for p in poly_gps]
+        all_lons = [p[1] for p in poly_gps]
+        bounds = [
+            [round(min(all_lats), 8), round(min(all_lons), 8)],
+            [round(max(all_lats), 8), round(max(all_lons), 8)]
+        ]
+        bbox = [
+            round(min(all_lons), 8),
+            round(min(all_lats), 8),
+            round(max(all_lons), 8),
+            round(max(all_lats), 8)
+        ]
+        is_georeferenced = True
+        crs_state = "GEOREFERENCED_WGS84"
+        effective_cm = None
+        notice = "Dữ liệu bản vẽ sử dụng hệ tọa độ WGS-84 (kinh vĩ độ nguyên bản)."
 
-    all_lats = [p[0] for p in poly_gps]
-    all_lons = [p[1] for p in poly_gps]
-    bounds = [
-        [round(min(all_lats), 8), round(min(all_lons), 8)],
-        [round(max(all_lats), 8), round(max(all_lons), 8)]
-    ]
-    bbox = [
-        round(min(all_lons), 8),
-        round(min(all_lats), 8),
-        round(max(all_lons), 8),
-        round(max(all_lats), 8)
-    ]
+    else:
+        # LOCAL_CAD_NON_GEOREFERENCED
+        cl_gps = []
+        poly_gps = []
+        branches_gps = []
+        islands_gps = []
+        all_surface_polygons = []
+        bounds = None
+        bbox = None
+        is_georeferenced = False
+        crs_state = "LOCAL_CAD_NON_GEOREFERENCED"
+        notice = "Bản vẽ sử dụng hệ tọa độ cục bộ (Local CAD) chưa gán tọa độ quốc gia VN-2000. Đã tự động chuyển sang chế độ CAD 2D để xem hình học bản vẽ."
 
     layer_counts = {}
     for e in msp:
@@ -1079,7 +1194,7 @@ def parse_road(
     if surface_area_sqm <= 0:
         surface_area_sqm = nominal_area_sqm
 
-    mid = len(poly_gps) // 2
+    mid = len(poly_gps) // 2 if poly_gps else 0
     return {
         "success": True,
         "roadName": "Tuyến đường hoàn chỉnh (Đầy đủ nhánh & nút giao)",
@@ -1090,7 +1205,7 @@ def parse_road(
         "centralMeridian": effective_cm,
         "scaleFactor": eff_k0,
         "axisOrder": eff_axis,
-        "crsMetadata": _build_crs_metadata(effective_cm, eff_k0, eff_axis),
+        "crsMetadata": _build_crs_metadata(effective_cm or 105.75, eff_k0, eff_axis),
         "bounds": bounds,
         "bbox": bbox,
         "centerline": cl_gps,
@@ -1099,8 +1214,15 @@ def parse_road(
         "roadSurfacePolygons": all_surface_polygons,
         "trafficIslands": islands_gps,
         "layerStats": layer_stats,
-        "leftEdge": poly_gps[:mid],
-        "rightEdge": poly_gps[mid:]
+        "leftEdge": poly_gps[:mid] if poly_gps else [],
+        "rightEdge": poly_gps[mid:] if poly_gps else [],
+        "isGeoreferenced": is_georeferenced,
+        "crsState": crs_state,
+        "notice": notice,
+        "candidateLayers": candidate_layers,
+        "centerlineCad": [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in main_chain],
+        "centerlineBranchesCad": [[[round(float(p[0]), 4), round(float(p[1]), 4)] for p in b] for b in raw_branches],
+        "roadSurfacePolygonCad": [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in poly_coords]
     }
 
 
@@ -1283,6 +1405,8 @@ def parse_coords(
         "scaleFactor": eff_k0,
         "axisOrder": resolved_axis,
         "crsMetadata": _build_crs_metadata(cm, eff_k0, resolved_axis),
+        "isGeoreferenced": True,
+        "crsState": "GEOREFERENCED_VN2000",
         "pointCount": n_pts,
         "bounds": bounds,
         "bbox": bbox,
@@ -1324,9 +1448,10 @@ def render_dxf_to_png(
     msp = doc.modelspace()
     ctx = RenderContext(doc)
 
-    chosen_layer = target_layer
-    if not chosen_layer:
-        chosen_layer, _ = _detect_centerline_layer(msp, doc)
+    best_layer, _, candidate_layers = _detect_centerline_layer(msp, doc)
+    chosen_layer = target_layer if target_layer else best_layer
+    for c in candidate_layers:
+        c["isSelected"] = (c["name"] == chosen_layer)
 
     # ?? Style Overrides for Realistic Road Visualization ?????????????
     original_resolve_all = ctx.resolve_all
