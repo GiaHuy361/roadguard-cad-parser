@@ -23,12 +23,14 @@ candidate_files = [
 ]
 
 executed_count = 0
+skipped_count = 0
 for path, cm, name, is_required in candidate_files:
     if not os.path.exists(path):
         if is_required:
             print(f"ERROR: Required fixture missing: {path}")
             sys.exit(1)
         else:
+            skipped_count += 1
             print(f"SKIP (optional fixture not present): {name}")
             continue
 
@@ -51,4 +53,4 @@ for path, cm, name, is_required in candidate_files:
     if res.get("notice"):
         print(f"  notice: {res.get('notice')}")
 
-print(f"\nCompleted multi-DXF matrix test for {executed_count} file(s).")
+print(f"\nSUMMARY: EXECUTED={executed_count}, SKIPPED={skipped_count}, TOTAL={len(candidate_files)}")
