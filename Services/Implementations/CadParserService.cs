@@ -385,6 +385,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             double slabLength        = 4.0,
             string? centerlineLayerName = null,
             double? centralMeridian  = null,
+            double? scaleFactor      = null,
+            string? axisOrder        = null,
             CancellationToken cancellationToken = default)
         {
             // ?? 1. Validate inputs ????????????????????????????????????????? //
@@ -398,8 +400,8 @@ namespace RoadGuard.CadParser.Services.Implementations
             var stopwatch = Stopwatch.StartNew();
 
             _logger.LogInformation(
-                "Starting DXF parse: file={FileName}, size={Size}B, srid={Srid}, tessSegs={Segs}, layer={Layer}, cm={Cm}",
-                file.FileName, file.Length, srid, tessellationSegments, centerlineLayerName ?? "(auto-detect)", centralMeridian);
+                "Starting DXF parse: file={FileName}, size={Size}B, srid={Srid}, tessSegs={Segs}, layer={Layer}, cm={Cm}, k0={K0}, axis={Axis}",
+                file.FileName, file.Length, srid, tessellationSegments, centerlineLayerName ?? "(auto-detect)", centralMeridian, scaleFactor, axisOrder);
 
             var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
             try
@@ -413,6 +415,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                 PythonParseResult? pyParseResult = null;
                 try
                 {
+                    var inv = System.Globalization.CultureInfo.InvariantCulture;
                     var bridgeArgs = $"parse \"{tempFile}\" --srid {srid}";
                     if (!string.IsNullOrWhiteSpace(centerlineLayerName))
                     {
@@ -420,7 +423,15 @@ namespace RoadGuard.CadParser.Services.Implementations
                     }
                     if (centralMeridian.HasValue && centralMeridian.Value > 0)
                     {
-                        bridgeArgs += $" --cm {centralMeridian.Value}";
+                        bridgeArgs += $" --cm {centralMeridian.Value.ToString(inv)}";
+                    }
+                    if (scaleFactor.HasValue && scaleFactor.Value > 0)
+                    {
+                        bridgeArgs += $" --k0 {scaleFactor.Value.ToString(inv)}";
+                    }
+                    if (!string.IsNullOrWhiteSpace(axisOrder))
+                    {
+                        bridgeArgs += $" --axis-order \"{axisOrder.Trim()}\"";
                     }
 
                     var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);

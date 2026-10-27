@@ -143,11 +143,21 @@ def _classify_coordinate_system(pts):
 
     return 'LOCAL_CAD_NON_GEOREFERENCED', False
 
-def _normalize_scale_factor(k0: float = None) -> float:
-    if k0 is not None and (abs(k0 - 0.9996) < 1e-4 or abs(k0 - 6.0) < 1e-2):
+def _normalize_scale_factor(k0: float = None, strict: bool = False) -> float:
+    if k0 is None:
+        return 0.9999
+    try:
+        val = float(k0)
+    except (ValueError, TypeError):
+        if strict:
+            raise ValueError(f"Hệ số co giãn múi chiếu k0 không hợp lệ: {k0}")
+        return 0.9999
+    if abs(val - 0.9996) < 1e-4 or abs(val - 6.0) < 1e-2:
         return 0.9996
-    if k0 is not None and 0.9990 <= k0 <= 1.0000:
-        return float(k0)
+    if 0.90 <= val <= 1.10:
+        return float(val)
+    if strict:
+        raise ValueError(f"Hệ số co giãn múi chiếu k0 ({val}) nằm ngoài phạm vi cho phép [0.9000..1.1000].")
     return 0.9999
 
 # =============================================================================
@@ -219,7 +229,7 @@ def project_wgs84_to_utm(points_lonlat: list, target_srid: int = 32648) -> list:
         return []
     tf = Transformer.from_crs(CRS.from_epsg(4326), CRS.from_epsg(target_srid), always_xy=True)
     xs, ys = tf.transform([p[0] for p in points_lonlat], [p[1] for p in points_lonlat])
-    return [{"x": round(float(x), 4), "y": round(float(y), 4)} for x, y in zip(xs, ys)]
+    return [{"x": round(float(x), 6), "y": round(float(y), 6)} for x, y in zip(xs, ys)]
 
 
 def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = None, scale_factor: float = 0.9999) -> list:
@@ -229,7 +239,7 @@ def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = 
     if abs(x0) <= 180.0 and abs(y0) <= 90.0 and target_srid == 4326:
         return [[round(float(x), 8), round(float(y), 8)] for x, y in points_xy]
     if not HAS_PYPROJ:
-        return [_manual_utm(x, y) for x, y in points_xy]
+        raise RuntimeError("Missing required geodetic library: pyproj is required for accurate VN-2000 geodetic projection.")
 
     cm = custom_cm if (custom_cm and custom_cm > 0) else detect_central_meridian(x0, y0)
     k0 = _normalize_scale_factor(scale_factor)
@@ -529,7 +539,7 @@ def _detect_centerline_layer(msp, doc):
 # Extract geometry (RFC 7946 GeoJSON FeatureCollection output)
 # =============================================================================
 
-def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_meridian: float = None):
+def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_meridian: float = None, scale_factor: float = None, axis_order: str = "AUTO"):
     doc = ezdxf.readfile(dxf_path_str)
     msp = doc.modelspace()
     all_layers = set(l.dxf.name for l in doc.layers if l.dxf.name)
@@ -579,15 +589,44 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
             "features": []
         }
 
+    if scale_factor is not None:
+        try:
+            sf_val = float(scale_factor)
+            if not (0.90 <= sf_val <= 1.10):
+                return {
+                    "success": False,
+                    "error": "InvalidScaleFactor",
+                    "detail": f"Hệ số co giãn múi chiếu k0 ({sf_val}) không hợp lệ (phải nằm trong khoảng [0.9000..1.1000])."
+                }
+            eff_k0 = _normalize_scale_factor(sf_val, strict=True)
+        except Exception:
+            return {
+                "success": False,
+                "error": "InvalidScaleFactor",
+                "detail": "Hệ số co giãn múi chiếu k0 không hợp lệ."
+            }
+    else:
+        eff_k0 = 0.9999
+    eff_axis = (axis_order or "AUTO").upper()
+    swap_xy = (eff_axis == "VN2000_XY")
+
+    def _normalize_extract_pt(p):
+        if eff_axis == "CAD_EN" and not swap_xy:
+            return (p[0], p[1])
+        if (p[0] > 950_000.0 and p[1] < 900_000.0) or swap_xy:
+            return (p[1], p[0])
+        return (p[0], p[1])
+
     features_out = []
     seg_counter = 1
 
     for item in layer_raw.get(chosen_layer, []):
-        pts = item["points"]
-        if len(pts) < 2:
+        raw_pts = item["points"]
+        if len(raw_pts) < 2:
             continue
 
-        projected = project_to_wgs84(pts, custom_cm=central_meridian) if srid == 4326 else project_points(pts, srid, custom_cm=central_meridian)
+        pts = [_normalize_extract_pt(p) for p in raw_pts]
+        projected = project_to_wgs84(pts, custom_cm=central_meridian, scale_factor=eff_k0) if srid == 4326 else project_points(pts, srid, custom_cm=central_meridian, scale_factor=eff_k0)
         if len(projected) < 2:
             continue
 
@@ -858,7 +897,14 @@ def parse_road(
             "detail": "Could not identify a centerline layer in the CAD drawing."
         }
 
-    eff_k0 = _normalize_scale_factor(scale_factor)
+    try:
+        eff_k0 = _normalize_scale_factor(scale_factor, strict=True)
+    except ValueError as e:
+        return {
+            "success": False,
+            "error": "InvalidScaleFactor",
+            "detail": str(e)
+        }
     eff_axis = (axis_order or "AUTO").upper()
     if eff_axis == "VN2000_XY":
         swap_xy = True
@@ -1259,7 +1305,14 @@ def parse_coords(
     payload_axis = payload.get("axisOrder") if isinstance(payload, dict) else None
     payload_cm = payload.get("centralMeridian") if isinstance(payload, dict) else None
 
-    eff_k0 = _normalize_scale_factor(scale_factor if scale_factor is not None else payload_k0)
+    try:
+        eff_k0 = _normalize_scale_factor(scale_factor if scale_factor is not None else payload_k0, strict=True)
+    except ValueError as e:
+        return {
+            "success": False,
+            "error": "InvalidScaleFactor",
+            "detail": str(e)
+        }
     eff_axis = str(axis_order or payload_axis or "AUTO").strip().upper()
     if eff_axis not in ("AUTO", "VN2000_XY", "CAD_EN"):
         eff_axis = "AUTO"
@@ -1651,7 +1704,17 @@ def transform_crs_payload(payload_path: str) -> dict:
     if cm < 100.0 or cm > 112.0:
         return {"success": False, "error": "InvalidCentralMeridian", "detail": f"Kinh tuyến trục L₀ ({cm}°) nằm ngoài phạm vi hợp lệ [100°..112°]."}
 
-    k0 = _normalize_scale_factor(payload.get("scaleFactor", 0.9999))
+    sf_raw = payload.get("scaleFactor")
+    if sf_raw is not None:
+        try:
+            sf_val = float(sf_raw)
+            if not (0.90 <= sf_val <= 1.10):
+                return {"success": False, "error": "InvalidScaleFactor", "detail": f"Hệ số múi chiếu k₀ ({sf_val}) nằm ngoài phạm vi hợp lệ [0.9..1.1]."}
+            k0 = _normalize_scale_factor(sf_val, strict=True)
+        except Exception:
+            return {"success": False, "error": "InvalidScaleFactor", "detail": "Hệ số múi chiếu k₀ không hợp lệ."}
+    else:
+        k0 = 0.9999
     axis_order = str(payload.get("axisOrder", "VN2000_XY")).strip().upper()
     pts = payload.get("points", [])
     if not isinstance(pts, list) or len(pts) == 0:
@@ -1821,6 +1884,7 @@ def main():
     pp.add_argument("--srid", type=int, default=4326)
     pp.add_argument("--cm", type=float, default=None, help="Custom Central Meridian")
     pp.add_argument("--k0", type=float, default=0.9999, help="Scale factor (0.9999 for 3deg, 0.9996 for 6deg)")
+    pp.add_argument("--axis-order", default="AUTO", help="Axis order: AUTO, VN2000_XY, CAD_EN")
 
     rpp = sub.add_parser("parse-road")
     rpp.add_argument("dxf_path")
@@ -1863,7 +1927,14 @@ def main():
         if args.command == "get-layers":
             print(json.dumps({"success": True, "layers": get_layers(args.dxf_path)}))
         elif args.command == "parse":
-            print(json.dumps(extract_geometries(args.dxf_path, args.layer, args.srid, getattr(args, "cm", None))))
+            print(json.dumps(extract_geometries(
+                args.dxf_path,
+                args.layer,
+                args.srid,
+                getattr(args, "cm", None),
+                getattr(args, "k0", None),
+                getattr(args, "axis_order", "AUTO")
+            )))
         elif args.command == "parse-road":
             print(json.dumps(parse_road(
                 args.dxf_path,

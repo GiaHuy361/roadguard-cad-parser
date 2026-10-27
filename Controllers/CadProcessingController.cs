@@ -74,6 +74,16 @@ namespace RoadGuard.CadParser.Controllers
         /// Optional custom central meridian for VN-2000 projections (e.g. 105.75 for HCMC/Long An).
         /// </summary>
         public double? CentralMeridian { get; set; }
+
+        /// <summary>
+        /// Scale factor k0 (e.g. 0.9999 for 3-degree zone, 0.9996 for 6-degree zone).
+        /// </summary>
+        public double? ScaleFactor { get; set; }
+
+        /// <summary>
+        /// Axis order convention: "AUTO", "VN2000_XY" (X=North, Y=East), or "CAD_EN" (E=East, N=North).
+        /// </summary>
+        public string? AxisOrder { get; set; }
     }
 
     /// <summary>
@@ -244,6 +254,16 @@ namespace RoadGuard.CadParser.Controllers
                 });
             }
 
+            if (request.ScaleFactor.HasValue && (request.ScaleFactor.Value < 0.90 || request.ScaleFactor.Value > 1.10))
+            {
+                return StatusCode((int)HttpStatusCode.UnprocessableEntity, new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.UnprocessableEntity,
+                    Error      = "InvalidScaleFactor",
+                    Detail     = $"Hệ số co giãn múi chiếu k0 ({request.ScaleFactor.Value}) không hợp lệ (phải nằm trong khoảng [0.9000..1.1000])."
+                });
+            }
+
             var file = request.File;
             var srid = request.TargetSrid;
             var tessellationSegments = request.TessellationSegments;
@@ -285,6 +305,8 @@ namespace RoadGuard.CadParser.Controllers
                     request.SlabLength,
                     request.CenterlineLayerName,
                     request.CentralMeridian,
+                    request.ScaleFactor,
+                    request.AxisOrder,
                     cancellationToken).ConfigureAwait(false);
 
                 return Ok(result);
@@ -428,6 +450,16 @@ namespace RoadGuard.CadParser.Controllers
                     StatusCode = (int)HttpStatusCode.BadRequest,
                     Error      = "EmptyCoordinates",
                     Detail     = "Vui lòng nhập danh sách tọa độ VN-2000."
+                });
+            }
+
+            if (request.ScaleFactor.HasValue && (request.ScaleFactor.Value < 0.90 || request.ScaleFactor.Value > 1.10))
+            {
+                return StatusCode((int)HttpStatusCode.UnprocessableEntity, new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.UnprocessableEntity,
+                    Error      = "InvalidScaleFactor",
+                    Detail     = $"Hệ số co giãn múi chiếu k0 ({request.ScaleFactor.Value}) không hợp lệ (phải nằm trong khoảng [0.9000..1.1000])."
                 });
             }
 
