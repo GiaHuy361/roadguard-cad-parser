@@ -168,4 +168,26 @@ app.UseAuthorization();
 app.MapControllers();
 app.MapHealthChecks("/health");
 
+// ── Test hook: ONLY registered in Development environment for benchmarks ── //
+// Strictly excluded on Production (Render) so no route exists in the routing table.
+if (app.Environment.IsDevelopment())
+{
+    app.MapPost("/api/cad/cache/evict", (HttpContext ctx) =>
+    {
+        var remoteIp = ctx.Connection.RemoteIpAddress;
+        if (remoteIp != null && !System.Net.IPAddress.IsLoopback(remoteIp))
+        {
+            return Results.NotFound(new { error = "NotFound", message = "Endpoint is not available." });
+        }
+
+        RoadGuard.CadParser.Services.Implementations.CadParserService.EnforceDiskCacheCapacity(force: true);
+        return Results.Ok(new
+        {
+            status = "evicted",
+            activeLeases = RoadGuard.CadParser.Services.Implementations.CadParserService.ActiveLeaseCount,
+            timestamp = DateTime.UtcNow
+        });
+    }).ExcludeFromDescription();
+}
+
 app.Run();

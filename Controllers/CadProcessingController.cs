@@ -11,7 +11,6 @@ using netDxf.Tables;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Hosting;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 using RoadGuard.CadParser.DTOs;
@@ -726,39 +725,5 @@ namespace RoadGuard.CadParser.Controllers
                 utc = DateTime.UtcNow,
                 activeLeases = RoadGuard.CadParser.Services.Implementations.CadParserService.ActiveLeaseCount
             });
-
-        [HttpPost("cache/evict")]
-        [ApiExplorerSettings(IgnoreApi = true)]
-        [ProducesResponseType(StatusCodes.Status200OK)]
-        [ProducesResponseType(StatusCodes.Status404NotFound)]
-        public IActionResult TriggerEviction(
-            [FromServices] IHostEnvironment env,
-            [FromHeader(Name = "X-RoadGuard-Internal-Test")] string? testSecret)
-        {
-            // Internal test hook: strictly inaccessible to public clients on production.
-            // On production (Render), external clients receive 404 Not Found.
-            // Only allowed if in Development OR loopback caller with internal test secret.
-            var remoteIp = HttpContext.Connection.RemoteIpAddress;
-            bool isLoopback = remoteIp == null || IPAddress.IsLoopback(remoteIp);
-
-            if (!env.IsDevelopment())
-            {
-                if (!isLoopback || string.IsNullOrWhiteSpace(testSecret) || testSecret != "rg-internal-cache-test-2026")
-                {
-                    return NotFound(new { error = "NotFound", message = "Endpoint is not available in production." });
-                }
-            }
-            else if (!isLoopback)
-            {
-                return NotFound(new { error = "NotFound", message = "Endpoint is not available." });
-            }
-
-            RoadGuard.CadParser.Services.Implementations.CadParserService.EnforceDiskCacheCapacity(force: true);
-            return Ok(new
-            {
-                status = "evicted",
-                activeLeases = RoadGuard.CadParser.Services.Implementations.CadParserService.ActiveLeaseCount
-            });
-        }
     }
 }
