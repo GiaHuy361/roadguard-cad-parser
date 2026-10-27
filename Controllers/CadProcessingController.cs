@@ -718,6 +718,24 @@ namespace RoadGuard.CadParser.Controllers
         [HttpGet("health")]
         [ProducesResponseType(StatusCodes.Status200OK)]
         public IActionResult Health()
-            => Ok(new { status = "healthy", service = "RoadGuard.CadParser", utc = DateTime.UtcNow });
+            => Ok(new
+            {
+                status = "healthy",
+                service = "RoadGuard.CadParser",
+                utc = DateTime.UtcNow,
+                activeLeases = RoadGuard.CadParser.Services.Implementations.CadParserService.ActiveLeaseCount
+            });
+
+        [HttpPost("cache/evict")]
+        [ProducesResponseType(StatusCodes.Status200OK)]
+        public IActionResult TriggerEviction()
+        {
+            RoadGuard.CadParser.Services.Implementations.CadParserService.EnforceDiskCacheCapacity(force: true);
+            return Ok(new
+            {
+                status = "evicted",
+                activeLeases = RoadGuard.CadParser.Services.Implementations.CadParserService.ActiveLeaseCount
+            });
+        }
     }
 }

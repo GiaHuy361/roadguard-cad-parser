@@ -95,6 +95,8 @@ namespace RoadGuard.CadParser.Services.Implementations
         // Active file reference tracking to prevent deleting files in-use by Python/netDxf
         private static readonly ConcurrentDictionary<string, int> _activeFileLeases = new(StringComparer.OrdinalIgnoreCase);
 
+        public static int ActiveLeaseCount => _activeFileLeases.Count;
+
         static CadParserService()
         {
             // Proactively clean up any stale staging files on application startup
@@ -131,12 +133,13 @@ namespace RoadGuard.CadParser.Services.Implementations
         public sealed class FileDiskLease : IDisposable
         {
             public string FilePath { get; }
+            private readonly string _fileHash;
             private int _disposed;
 
-            public FileDiskLease(string path)
+            public FileDiskLease(string path, string fileHash)
             {
                 FilePath = path;
-                _activeFileLeases.AddOrUpdate(path, 1, (_, count) => count + 1);
+                _fileHash = fileHash;
                 try
                 {
                     var now = DateTime.UtcNow;
@@ -150,8 +153,32 @@ namespace RoadGuard.CadParser.Services.Implementations
             {
                 if (Interlocked.Exchange(ref _disposed, 1) == 0)
                 {
-                    _activeFileLeases.AddOrUpdate(FilePath, 0, (_, count) => Math.Max(0, count - 1));
+                    ReleaseLease(FilePath, _fileHash);
                 }
+            }
+        }
+
+        private static void ReleaseLease(string path, string fileHash)
+        {
+            var lockObj = GetStripeLock(fileHash);
+            lockObj.Wait();
+            try
+            {
+                if (_activeFileLeases.TryGetValue(path, out var count))
+                {
+                    if (count <= 1)
+                    {
+                        _activeFileLeases.TryRemove(path, out _);
+                    }
+                    else
+                    {
+                        _activeFileLeases[path] = count - 1;
+                    }
+                }
+            }
+            finally
+            {
+                lockObj.Release();
             }
         }
 
@@ -168,12 +195,15 @@ namespace RoadGuard.CadParser.Services.Implementations
             catch { }
         }
 
-        private static void EnforceDiskCacheCapacity()
+        public static void EnforceDiskCacheCapacity(bool force = false)
         {
-            var nowTicks = Environment.TickCount64;
-            var last = Interlocked.Read(ref _lastDiskCleanupTicks);
-            if (nowTicks - last < 5_000) return; // at most once every 5 seconds
-            Interlocked.Exchange(ref _lastDiskCleanupTicks, nowTicks);
+            if (!force)
+            {
+                var nowTicks = Environment.TickCount64;
+                var last = Interlocked.Read(ref _lastDiskCleanupTicks);
+                if (nowTicks - last < 5_000) return; // at most once every 5 seconds
+                Interlocked.Exchange(ref _lastDiskCleanupTicks, nowTicks);
+            }
 
             try
             {
@@ -201,7 +231,7 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                 bool exceedsSize = totalBytes > MaxDiskCacheBytes;
                 bool hasExpired = fileInfos.Any(fi => (now - (fi.LastWriteTimeUtc > fi.LastAccessTimeUtc ? fi.LastWriteTimeUtc : fi.LastAccessTimeUtc)) > DiskCacheFileTtl);
-                if (!exceedsSize && !hasExpired) return;
+                if (!force && !exceedsSize && !hasExpired) return;
 
                 fileInfos.Sort((a, b) =>
                 {
@@ -212,23 +242,41 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                 foreach (var fi in fileInfos)
                 {
-                    // Do NOT delete file if in-use by an active Python or netDxf process
-                    if (_activeFileLeases.TryGetValue(fi.FullName, out var inUse) && inUse > 0)
-                    {
-                        continue;
-                    }
+                    var fileName = fi.Name;
+                    var fileHash = (fileName.StartsWith("rg_") && fileName.EndsWith(".dxf") && fileName.Length == 71)
+                        ? fileName.Substring(3, 64)
+                        : fileName;
 
-                    var lastActivity = fi.LastWriteTimeUtc > fi.LastAccessTimeUtc ? fi.LastWriteTimeUtc : fi.LastAccessTimeUtc;
-                    bool isOld = (now - lastActivity) > DiskCacheFileTtl;
-                    if (isOld || totalBytes > TargetDiskCacheBytes)
+                    var lockObj = GetStripeLock(fileHash);
+                    lockObj.Wait();
+                    try
                     {
-                        try
+                        // Double check active lease status under stripe lock
+                        if (_activeFileLeases.TryGetValue(fi.FullName, out var inUse) && inUse > 0)
                         {
-                            var len = fi.Length;
-                            fi.Delete();
-                            totalBytes -= len;
+                            continue;
                         }
-                        catch { }
+
+                        fi.Refresh();
+                        if (!fi.Exists) continue;
+
+                        var lastActivity = fi.LastWriteTimeUtc > fi.LastAccessTimeUtc ? fi.LastWriteTimeUtc : fi.LastAccessTimeUtc;
+                        bool isOld = (now - lastActivity) > DiskCacheFileTtl;
+                        if (force || isOld || totalBytes > TargetDiskCacheBytes)
+                        {
+                            try
+                            {
+                                var len = fi.Length;
+                                fi.Delete();
+                                totalBytes -= len;
+                                _activeFileLeases.TryRemove(fi.FullName, out _);
+                            }
+                            catch { }
+                        }
+                    }
+                    finally
+                    {
+                        lockObj.Release();
                     }
                 }
             }
@@ -241,6 +289,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             var lockObj = GetStripeLock(fileHash);
             await lockObj.WaitAsync(ct).ConfigureAwait(false);
             string? stagingPath = null;
+            FileDiskLease lease;
             try
             {
                 if (!File.Exists(targetPath) || new FileInfo(targetPath).Length != file.Length)
@@ -264,15 +313,18 @@ namespace RoadGuard.CadParser.Services.Implementations
                     }
                 }
 
-                // Acquire lease first to prevent disk compaction from deleting targetPath
-                var lease = new FileDiskLease(targetPath);
-                EnforceDiskCacheCapacity();
-                return lease;
+                // Increment active ref-count atomically under stripe lock
+                _activeFileLeases.AddOrUpdate(targetPath, 1, (_, c) => c + 1);
+                lease = new FileDiskLease(targetPath, fileHash);
             }
             finally
             {
                 lockObj.Release();
             }
+
+            // Non-blocking background capacity check
+            _ = Task.Run(() => EnforceDiskCacheCapacity());
+            return lease;
         }
 
         // ================================================================== //
@@ -316,6 +368,10 @@ namespace RoadGuard.CadParser.Services.Implementations
                         }
                         return pyRes.Layers;
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -661,6 +717,10 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                     var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
                     pyParseResult = Newtonsoft.Json.JsonConvert.DeserializeObject<PythonParseResult>(json);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
                 }
                 catch (Exception ex)
                 {
@@ -1015,7 +1075,33 @@ namespace RoadGuard.CadParser.Services.Implementations
             var outputTask = process.StandardOutput.ReadToEndAsync();
             var errorTask = process.StandardError.ReadToEndAsync();
 
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                try
+                {
+                    if (!process.HasExited)
+                    {
+                        process.Kill(entireProcessTree: true);
+                        using var killCts = new CancellationTokenSource(3000);
+                        try
+                        {
+                            await process.WaitForExitAsync(killCts.Token).ConfigureAwait(false);
+                        }
+                        catch { }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Failed to kill Python child process on cancellation.");
+                }
+
+                throw;
+            }
+
             var output = await outputTask.ConfigureAwait(false);
             var error = await errorTask.ConfigureAwait(false);
 
