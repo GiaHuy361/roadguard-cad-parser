@@ -55,9 +55,12 @@ def get_health():
     with urllib.request.urlopen(url, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def trigger_evict():
+def trigger_evict(as_internal_hook=True):
     url = f"{BASE_URL}/api/cad/cache/evict"
-    req = urllib.request.Request(url, data=b"", headers={"Content-Length": "0"}, method="POST")
+    headers = {"Content-Length": "0"}
+    if as_internal_hook:
+        headers["X-RoadGuard-Internal-Test"] = "rg-internal-cache-test-2026"
+    req = urllib.request.Request(url, data=b"", headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=10) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -77,6 +80,43 @@ def record_fail(msg):
     global total_failed
     total_failed += 1
     print(f"  [FAIL] {msg}")
+
+# ---------------------------------------------------------------------------
+# TEST 0: Verify Production API Security (cache/evict endpoint blocked)
+# ---------------------------------------------------------------------------
+print("\n[TEST 0] Production Security Check: verify /api/cad/cache/evict is blocked")
+url = f"{BASE_URL}/api/cad/cache/evict"
+# 0.1 Unauthorized call without internal secret MUST return HTTP 404 on Production
+try:
+    req_unauth = urllib.request.Request(url, data=b"", headers={"Content-Length": "0"}, method="POST")
+    with urllib.request.urlopen(req_unauth, timeout=10) as resp:
+        record_fail("Security violation! /api/cad/cache/evict was accessible without internal authorization.")
+except urllib.error.HTTPError as ex:
+    if ex.code == 404:
+        record_pass("Production Security verified: /api/cad/cache/evict returned HTTP 404 Not Found for public callers.")
+    else:
+        record_fail(f"Expected HTTP 404, got {ex.code}")
+
+# 0.2 Call with invalid secret header MUST also return HTTP 404
+try:
+    req_bad = urllib.request.Request(url, data=b"", headers={"Content-Length": "0", "X-RoadGuard-Internal-Test": "invalid-token"}, method="POST")
+    with urllib.request.urlopen(req_bad, timeout=10) as resp:
+        record_fail("Security violation! /api/cad/cache/evict accepted invalid test token.")
+except urllib.error.HTTPError as ex:
+    if ex.code == 404:
+        record_pass("Production Security verified: /api/cad/cache/evict strictly rejected invalid test token with HTTP 404.")
+    else:
+        record_fail(f"Expected HTTP 404, got {ex.code}")
+
+# 0.3 Internal loopback call with valid secret header succeeds for stress testing
+try:
+    evict_res = trigger_evict(as_internal_hook=True)
+    if evict_res.get("status") == "evicted":
+        record_pass("Internal loopback test hook successfully authorized for local stress testing.")
+    else:
+        record_fail(f"Internal hook unexpected status: {evict_res}")
+except Exception as ex:
+    record_fail(f"Internal test hook failed: {ex}")
 
 # ---------------------------------------------------------------------------
 # TEST 1: Multiple Concurrent Requests Acquiring/Releasing the Same DXF
@@ -329,6 +369,7 @@ if len(rg_sample) == 1:
     old_time = time.time() - 7200
     os.utime(rg_sample[0], (old_time, old_time))
     trigger_evict()
+    time.sleep(0.5)
     rg_sample_after = glob.glob(os.path.join(temp_dir, "rg_1340d7c30ea27859dd640fd897e5d7685464a43da923e9aeb016bea1c148b6fc.dxf"))
     if len(rg_sample_after) == 0:
         record_pass("Expired, unleased file correctly reclaimed by disk eviction.")
