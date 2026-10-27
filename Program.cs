@@ -35,7 +35,9 @@ builder.Logging.AddDebug();
 // In-Memory Caching for DXF geometry and parsed models (LRU bounded)
 builder.Services.AddMemoryCache(options =>
 {
-    options.SizeLimit = 200;
+    options.SizeLimit = 100;
+    options.CompactionPercentage = 0.25;
+    options.ExpirationScanFrequency = TimeSpan.FromMinutes(2);
 });
 
 builder.Services.AddScoped<ICadParserService, CadParserService>();

@@ -79,8 +79,27 @@ namespace RoadGuard.CadParser.Services.Implementations
         private readonly IMemoryCache?              _cache;
         private readonly RoadGuardDbContext?        _db;
 
-        private static readonly TimeSpan DefaultCacheTtl = TimeSpan.FromMinutes(20);
-        private static readonly ConcurrentDictionary<string, SemaphoreSlim> _fileDiskLocks = new();
+        private static readonly TimeSpan DefaultSlidingTtl = TimeSpan.FromMinutes(15);
+        private static readonly TimeSpan DefaultAbsoluteTtl = TimeSpan.FromHours(1);
+
+        private const long MaxDiskCacheBytes = 250L * 1024 * 1024;    // 250 MB
+        private const long TargetDiskCacheBytes = 180L * 1024 * 1024; // 180 MB
+        private static readonly TimeSpan DiskCacheFileTtl = TimeSpan.FromMinutes(30);
+        private static long _lastDiskCleanupTicks;
+
+        // Bounded striped locks (64 stripes) to prevent dictionary memory leaks
+        private static readonly SemaphoreSlim[] _diskStripeLocks = Enumerable.Range(0, 64)
+            .Select(_ => new SemaphoreSlim(1, 1))
+            .ToArray();
+
+        // Active file reference tracking to prevent deleting files in-use by Python/netDxf
+        private static readonly ConcurrentDictionary<string, int> _activeFileLeases = new(StringComparer.OrdinalIgnoreCase);
+
+        static CadParserService()
+        {
+            // Proactively clean up any stale staging files on application startup
+            SweepOrphanStagingFiles();
+        }
 
         // ------------------------------------------------------------------ //
         //  Constructor                                                         //
@@ -100,25 +119,155 @@ namespace RoadGuard.CadParser.Services.Implementations
             return Convert.ToHexString(hashBytes).ToLowerInvariant();
         }
 
-        private async Task<string> EnsureDxfOnDiskAsync(IFormFile file, string fileHash, CancellationToken ct)
+        private static SemaphoreSlim GetStripeLock(string fileHash)
         {
-            var targetPath = Path.Combine(Path.GetTempPath(), $"rg_{fileHash}.dxf");
-            var lockObj = _fileDiskLocks.GetOrAdd(fileHash, _ => new SemaphoreSlim(1, 1));
-            await lockObj.WaitAsync(ct).ConfigureAwait(false);
+            var idx = (uint)fileHash.GetHashCode() % (uint)_diskStripeLocks.Length;
+            return _diskStripeLocks[idx];
+        }
+
+        /// <summary>
+        /// RAII lease ensuring disk file is never deleted while actively referenced by an in-flight operation.
+        /// </summary>
+        public sealed class FileDiskLease : IDisposable
+        {
+            public string FilePath { get; }
+            private int _disposed;
+
+            public FileDiskLease(string path)
+            {
+                FilePath = path;
+                _activeFileLeases.AddOrUpdate(path, 1, (_, count) => count + 1);
+                try
+                {
+                    var now = DateTime.UtcNow;
+                    File.SetLastAccessTimeUtc(path, now);
+                    File.SetLastWriteTimeUtc(path, now);
+                }
+                catch { }
+            }
+
+            public void Dispose()
+            {
+                if (Interlocked.Exchange(ref _disposed, 1) == 0)
+                {
+                    _activeFileLeases.AddOrUpdate(FilePath, 0, (_, count) => Math.Max(0, count - 1));
+                }
+            }
+        }
+
+        private static void SweepOrphanStagingFiles()
+        {
             try
             {
-                if (File.Exists(targetPath) && new FileInfo(targetPath).Length == file.Length)
+                var tempDir = Path.GetTempPath();
+                foreach (var f in Directory.GetFiles(tempDir, "staging_*.dxf"))
                 {
-                    return targetPath;
+                    try { File.Delete(f); } catch { }
+                }
+            }
+            catch { }
+        }
+
+        private static void EnforceDiskCacheCapacity()
+        {
+            var nowTicks = Environment.TickCount64;
+            var last = Interlocked.Read(ref _lastDiskCleanupTicks);
+            if (nowTicks - last < 5_000) return; // at most once every 5 seconds
+            Interlocked.Exchange(ref _lastDiskCleanupTicks, nowTicks);
+
+            try
+            {
+                var tempDir = Path.GetTempPath();
+                var files = Directory.GetFiles(tempDir, "rg_*.dxf");
+                if (files.Length == 0) return;
+
+                var fileInfos = new List<FileInfo>();
+                long totalBytes = 0;
+                var now = DateTime.UtcNow;
+
+                foreach (var f in files)
+                {
+                    try
+                    {
+                        var fi = new FileInfo(f);
+                        if (fi.Exists)
+                        {
+                            totalBytes += fi.Length;
+                            fileInfos.Add(fi);
+                        }
+                    }
+                    catch { }
                 }
 
-                var stagingPath = Path.Combine(Path.GetTempPath(), $"staging_{Guid.NewGuid():N}.dxf");
-                await using (var fs = new FileStream(stagingPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                bool exceedsSize = totalBytes > MaxDiskCacheBytes;
+                bool hasExpired = fileInfos.Any(fi => (now - (fi.LastWriteTimeUtc > fi.LastAccessTimeUtc ? fi.LastWriteTimeUtc : fi.LastAccessTimeUtc)) > DiskCacheFileTtl);
+                if (!exceedsSize && !hasExpired) return;
+
+                fileInfos.Sort((a, b) =>
                 {
-                    await file.CopyToAsync(fs, ct).ConfigureAwait(false);
+                    var aTime = a.LastWriteTimeUtc > a.LastAccessTimeUtc ? a.LastWriteTimeUtc : a.LastAccessTimeUtc;
+                    var bTime = b.LastWriteTimeUtc > b.LastAccessTimeUtc ? b.LastWriteTimeUtc : b.LastAccessTimeUtc;
+                    return aTime.CompareTo(bTime);
+                });
+
+                foreach (var fi in fileInfos)
+                {
+                    // Do NOT delete file if in-use by an active Python or netDxf process
+                    if (_activeFileLeases.TryGetValue(fi.FullName, out var inUse) && inUse > 0)
+                    {
+                        continue;
+                    }
+
+                    var lastActivity = fi.LastWriteTimeUtc > fi.LastAccessTimeUtc ? fi.LastWriteTimeUtc : fi.LastAccessTimeUtc;
+                    bool isOld = (now - lastActivity) > DiskCacheFileTtl;
+                    if (isOld || totalBytes > TargetDiskCacheBytes)
+                    {
+                        try
+                        {
+                            var len = fi.Length;
+                            fi.Delete();
+                            totalBytes -= len;
+                        }
+                        catch { }
+                    }
                 }
-                File.Move(stagingPath, targetPath, overwrite: true);
-                return targetPath;
+            }
+            catch { }
+        }
+
+        private async Task<FileDiskLease> AcquireDxfOnDiskLeaseAsync(IFormFile file, string fileHash, CancellationToken ct)
+        {
+            var targetPath = Path.Combine(Path.GetTempPath(), $"rg_{fileHash}.dxf");
+            var lockObj = GetStripeLock(fileHash);
+            await lockObj.WaitAsync(ct).ConfigureAwait(false);
+            string? stagingPath = null;
+            try
+            {
+                if (!File.Exists(targetPath) || new FileInfo(targetPath).Length != file.Length)
+                {
+                    stagingPath = Path.Combine(Path.GetTempPath(), $"staging_{Guid.NewGuid():N}.dxf");
+                    try
+                    {
+                        await using (var fs = new FileStream(stagingPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, useAsync: true))
+                        {
+                            await file.CopyToAsync(fs, ct).ConfigureAwait(false);
+                        }
+                        File.Move(stagingPath, targetPath, overwrite: true);
+                        stagingPath = null;
+                    }
+                    finally
+                    {
+                        if (stagingPath != null && File.Exists(stagingPath))
+                        {
+                            try { File.Delete(stagingPath); } catch { }
+                        }
+                    }
+                }
+
+                // Acquire lease first to prevent disk compaction from deleting targetPath
+                var lease = new FileDiskLease(targetPath);
+                EnforceDiskCacheCapacity();
+                return lease;
             }
             finally
             {
@@ -145,7 +294,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                 return cachedLayers;
             }
 
-            var tempFile = await EnsureDxfOnDiskAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
+            using var lease = await AcquireDxfOnDiskLeaseAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
+            var tempFile = lease.FilePath;
             try
             {
 
@@ -159,7 +309,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                         {
                             _cache.Set(cacheKey, pyRes.Layers, new MemoryCacheEntryOptions
                             {
-                                SlidingExpiration = DefaultCacheTtl,
+                                SlidingExpiration = DefaultSlidingTtl,
+                                AbsoluteExpirationRelativeToNow = DefaultAbsoluteTtl,
                                 Size = 1
                             });
                         }
@@ -210,7 +361,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                     {
                         _cache.Set(cacheKey, sortedList, new MemoryCacheEntryOptions
                         {
-                            SlidingExpiration = DefaultCacheTtl,
+                            SlidingExpiration = DefaultSlidingTtl,
+                            AbsoluteExpirationRelativeToNow = DefaultAbsoluteTtl,
                             Size = 1
                         });
                     }
@@ -237,7 +389,11 @@ namespace RoadGuard.CadParser.Services.Implementations
 
             var fileHash = await ComputeFileSha256Async(file, cancellationToken).ConfigureAwait(false);
             var inv = System.Globalization.CultureInfo.InvariantCulture;
-            var cacheKey = $"ROAD_{fileHash}_{roadWidth.ToString("F4", inv)}_{centerlineLayerName ?? "AUTO"}_{centralMeridian?.ToString("F4", inv) ?? "AUTO"}_{scaleFactor?.ToString("F6", inv) ?? "AUTO"}_{axisOrder ?? "AUTO"}";
+            var normLayer = string.IsNullOrWhiteSpace(centerlineLayerName) ? "AUTO" : centerlineLayerName.Trim().ToUpperInvariant();
+            var normAxis = string.IsNullOrWhiteSpace(axisOrder) ? "AUTO" : axisOrder.Trim().ToUpperInvariant();
+            var cmStr = centralMeridian.HasValue && centralMeridian.Value > 0 ? centralMeridian.Value.ToString("F4", inv) : "AUTO";
+            var k0Str = scaleFactor.HasValue && scaleFactor.Value > 0 ? scaleFactor.Value.ToString("F6", inv) : "AUTO";
+            var cacheKey = $"ROAD_{fileHash}_{roadWidth.ToString("F4", inv)}_{normLayer}_{cmStr}_{k0Str}_{normAxis}";
 
             if (_cache != null && _cache.TryGetValue(cacheKey, out CadParseRoadResponse? cachedRoad) && cachedRoad != null)
             {
@@ -245,7 +401,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                 return cachedRoad;
             }
 
-            var tempFile = await EnsureDxfOnDiskAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
+            using var lease = await AcquireDxfOnDiskLeaseAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
+            var tempFile = lease.FilePath;
             try
             {
                 var bridgeArgs = $"parse-road \"{tempFile}\" --width {roadWidth.ToString(inv)}";
@@ -281,10 +438,12 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                 if (_cache != null && result != null && result.Success)
                 {
+                    var roadWeight = Math.Clamp((int)Math.Ceiling(((result.Centerline?.Count ?? 0) + (result.RoadSurfacePolygon?.Count ?? 0)) / 1000.0), 2, 10);
                     _cache.Set(cacheKey, result, new MemoryCacheEntryOptions
                     {
-                        SlidingExpiration = DefaultCacheTtl,
-                        Size = 2
+                        SlidingExpiration = DefaultSlidingTtl,
+                        AbsoluteExpirationRelativeToNow = DefaultAbsoluteTtl,
+                        Size = roadWeight
                     });
                 }
                 return result;
@@ -410,36 +569,24 @@ namespace RoadGuard.CadParser.Services.Implementations
         {
             ValidateFile(file);
 
-            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
-            try
+            var fileHash = await ComputeFileSha256Async(file, cancellationToken).ConfigureAwait(false);
+            using var lease = await AcquireDxfOnDiskLeaseAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
+            var tempFile = lease.FilePath;
+
+            var bridgeArgs = $"render \"{tempFile}\" --size {outputSizePx} --width {roadWidth}";
+            if (!string.IsNullOrWhiteSpace(centerlineLayerName))
             {
-                await using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
-                }
-
-                var bridgeArgs = $"render \"{tempFile}\" --size {outputSizePx} --width {roadWidth}";
-                if (!string.IsNullOrWhiteSpace(centerlineLayerName))
-                {
-                    bridgeArgs += $" --layer \"{centerlineLayerName}\"";
-                }
-
-                var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
-                var result = Newtonsoft.Json.JsonConvert.DeserializeObject<CadRenderOverlayResponse>(json);
-                if (result is null || !result.Success)
-                {
-                    throw new InvalidOperationException(result?.Detail ?? result?.Error ?? "Raster render failed in Python bridge.");
-                }
-
-                return result;
+                bridgeArgs += $" --layer \"{centerlineLayerName}\"";
             }
-            finally
+
+            var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+            var result = Newtonsoft.Json.JsonConvert.DeserializeObject<CadRenderOverlayResponse>(json);
+            if (result is null || !result.Success)
             {
-                if (File.Exists(tempFile))
-                {
-                    try { File.Delete(tempFile); } catch { }
-                }
+                throw new InvalidOperationException(result?.Detail ?? result?.Error ?? "Raster render failed in Python bridge.");
             }
+
+            return result;
         }
 
         /// <inheritdoc/>
@@ -472,7 +619,11 @@ namespace RoadGuard.CadParser.Services.Implementations
 
             var fileHash = await ComputeFileSha256Async(file, cancellationToken).ConfigureAwait(false);
             var invDxf = System.Globalization.CultureInfo.InvariantCulture;
-            var cacheKey = $"DXF_{fileHash}_{srid}_{tessellationSegments}_{segmentLength.ToString("F2", invDxf)}_{roadWidth.ToString("F2", invDxf)}_{slabLength.ToString("F2", invDxf)}_{centerlineLayerName ?? "AUTO"}_{centralMeridian?.ToString("F4", invDxf) ?? "AUTO"}_{scaleFactor?.ToString("F6", invDxf) ?? "AUTO"}_{axisOrder ?? "AUTO"}";
+            var normLayer = string.IsNullOrWhiteSpace(centerlineLayerName) ? "AUTO" : centerlineLayerName.Trim().ToUpperInvariant();
+            var normAxis = string.IsNullOrWhiteSpace(axisOrder) ? "AUTO" : axisOrder.Trim().ToUpperInvariant();
+            var cmStr = centralMeridian.HasValue && centralMeridian.Value > 0 ? centralMeridian.Value.ToString("F4", invDxf) : "AUTO";
+            var k0Str = scaleFactor.HasValue && scaleFactor.Value > 0 ? scaleFactor.Value.ToString("F6", invDxf) : "AUTO";
+            var cacheKey = $"DXF_{fileHash}_{srid}_{tessellationSegments}_{segmentLength.ToString("F2", invDxf)}_{roadWidth.ToString("F2", invDxf)}_{slabLength.ToString("F2", invDxf)}_{normLayer}_{cmStr}_{k0Str}_{normAxis}";
 
             if (_cache != null && _cache.TryGetValue(cacheKey, out GeoJsonResponse? cachedDxf) && cachedDxf != null)
             {
@@ -480,7 +631,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                 return cachedDxf;
             }
 
-            var tempFile = await EnsureDxfOnDiskAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
+            using var lease = await AcquireDxfOnDiskLeaseAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
+            var tempFile = lease.FilePath;
             try
             {
 
@@ -657,10 +809,12 @@ namespace RoadGuard.CadParser.Services.Implementations
                     };
                     if (_cache != null)
                     {
+                        var dxfWeight = Math.Clamp((int)Math.Ceiling(feats.Count / 500.0), 3, 35);
                         _cache.Set(cacheKey, pyResponse, new MemoryCacheEntryOptions
                         {
-                            SlidingExpiration = DefaultCacheTtl,
-                            Size = 2
+                            SlidingExpiration = DefaultSlidingTtl,
+                            AbsoluteExpirationRelativeToNow = DefaultAbsoluteTtl,
+                            Size = dxfWeight
                         });
                     }
                     return pyResponse;
@@ -815,10 +969,12 @@ namespace RoadGuard.CadParser.Services.Implementations
                 };
                 if (_cache != null)
                 {
+                    var dxfWeight = Math.Clamp((int)Math.Ceiling(features.Count / 500.0), 3, 35);
                     _cache.Set(cacheKey, netDxfResponse, new MemoryCacheEntryOptions
                     {
-                        SlidingExpiration = DefaultCacheTtl,
-                        Size = 2
+                        SlidingExpiration = DefaultSlidingTtl,
+                        AbsoluteExpirationRelativeToNow = DefaultAbsoluteTtl,
+                        Size = dxfWeight
                     });
                 }
                 return netDxfResponse;
