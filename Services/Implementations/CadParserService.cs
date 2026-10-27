@@ -9,6 +9,9 @@ using GeoJSON.Net.Feature;
 using GeoJSON.Net.Geometry;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Caching.Memory;
+using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using NetTopologySuite.Geometries;
 using NetTopologySuite.LinearReferencing;
 using netDxf;
@@ -73,15 +76,54 @@ namespace RoadGuard.CadParser.Services.Implementations
         //  Dependencies                                                        //
         // ------------------------------------------------------------------ //
         private readonly ILogger<CadParserService> _logger;
+        private readonly IMemoryCache?              _cache;
         private readonly RoadGuardDbContext?        _db;
+
+        private static readonly TimeSpan DefaultCacheTtl = TimeSpan.FromMinutes(20);
+        private static readonly ConcurrentDictionary<string, SemaphoreSlim> _fileDiskLocks = new();
 
         // ------------------------------------------------------------------ //
         //  Constructor                                                         //
         // ------------------------------------------------------------------ //
-        public CadParserService(ILogger<CadParserService> logger, RoadGuardDbContext? db = null)
+        public CadParserService(ILogger<CadParserService> logger, IMemoryCache? cache = null, RoadGuardDbContext? db = null)
         {
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _cache  = cache;
             _db     = db;   // null when no database is configured (persistence is optional)
+        }
+
+        private static async Task<string> ComputeFileSha256Async(IFormFile file, CancellationToken ct)
+        {
+            using var sha = SHA256.Create();
+            await using var s = file.OpenReadStream();
+            var hashBytes = await sha.ComputeHashAsync(s, ct).ConfigureAwait(false);
+            return Convert.ToHexString(hashBytes).ToLowerInvariant();
+        }
+
+        private async Task<string> EnsureDxfOnDiskAsync(IFormFile file, string fileHash, CancellationToken ct)
+        {
+            var targetPath = Path.Combine(Path.GetTempPath(), $"rg_{fileHash}.dxf");
+            var lockObj = _fileDiskLocks.GetOrAdd(fileHash, _ => new SemaphoreSlim(1, 1));
+            await lockObj.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (File.Exists(targetPath) && new FileInfo(targetPath).Length == file.Length)
+                {
+                    return targetPath;
+                }
+
+                var stagingPath = Path.Combine(Path.GetTempPath(), $"staging_{Guid.NewGuid():N}.dxf");
+                await using (var fs = new FileStream(stagingPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    await file.CopyToAsync(fs, ct).ConfigureAwait(false);
+                }
+                File.Move(stagingPath, targetPath, overwrite: true);
+                return targetPath;
+            }
+            finally
+            {
+                lockObj.Release();
+            }
         }
 
         // ================================================================== //
@@ -95,13 +137,17 @@ namespace RoadGuard.CadParser.Services.Implementations
         {
             ValidateFile(file);
 
-            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
+            var fileHash = await ComputeFileSha256Async(file, cancellationToken).ConfigureAwait(false);
+            var cacheKey = $"LAYERS_{fileHash}";
+            if (_cache != null && _cache.TryGetValue(cacheKey, out List<string>? cachedLayers) && cachedLayers != null)
+            {
+                _logger.LogInformation("MemoryCache HIT for GetLayers (Hash={Hash}, Count={Count})", fileHash, cachedLayers.Count);
+                return cachedLayers;
+            }
+
+            var tempFile = await EnsureDxfOnDiskAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
             try
             {
-                await using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
-                }
 
                 try
                 {
@@ -109,6 +155,14 @@ namespace RoadGuard.CadParser.Services.Implementations
                     var pyRes = Newtonsoft.Json.JsonConvert.DeserializeObject<PythonLayersResult>(json);
                     if (pyRes is not null && pyRes.Success && pyRes.Layers.Count > 0)
                     {
+                        if (_cache != null)
+                        {
+                            _cache.Set(cacheKey, pyRes.Layers, new MemoryCacheEntryOptions
+                            {
+                                SlidingExpiration = DefaultCacheTtl,
+                                Size = 1
+                            });
+                        }
                         return pyRes.Layers;
                     }
                 }
@@ -151,15 +205,20 @@ namespace RoadGuard.CadParser.Services.Implementations
                     foreach (var e in dxfDoc.Points)      if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
                     foreach (var e in dxfDoc.Hatches)     if (!string.IsNullOrWhiteSpace(e.Layer?.Name)) layerNames.Add(e.Layer.Name);
 
-                    return layerNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+                    var sortedList = layerNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase).ToList();
+                    if (_cache != null && sortedList.Count > 0)
+                    {
+                        _cache.Set(cacheKey, sortedList, new MemoryCacheEntryOptions
+                        {
+                            SlidingExpiration = DefaultCacheTtl,
+                            Size = 1
+                        });
+                    }
+                    return sortedList;
                 }, cancellationToken).ConfigureAwait(false);
             }
             finally
             {
-                if (File.Exists(tempFile))
-                {
-                    try { File.Delete(tempFile); } catch { }
-                }
             }
         }
 
@@ -176,15 +235,19 @@ namespace RoadGuard.CadParser.Services.Implementations
         {
             ValidateFile(file);
 
-            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
+            var fileHash = await ComputeFileSha256Async(file, cancellationToken).ConfigureAwait(false);
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var cacheKey = $"ROAD_{fileHash}_{roadWidth.ToString("F4", inv)}_{centerlineLayerName ?? "AUTO"}_{centralMeridian?.ToString("F4", inv) ?? "AUTO"}_{scaleFactor?.ToString("F6", inv) ?? "AUTO"}_{axisOrder ?? "AUTO"}";
+
+            if (_cache != null && _cache.TryGetValue(cacheKey, out CadParseRoadResponse? cachedRoad) && cachedRoad != null)
+            {
+                _logger.LogInformation("MemoryCache HIT for ParseRoad (Key={Key})", cacheKey);
+                return cachedRoad;
+            }
+
+            var tempFile = await EnsureDxfOnDiskAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
             try
             {
-                await using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
-                }
-
-                var inv = System.Globalization.CultureInfo.InvariantCulture;
                 var bridgeArgs = $"parse-road \"{tempFile}\" --width {roadWidth.ToString(inv)}";
                 if (!string.IsNullOrWhiteSpace(centerlineLayerName))
                 {
@@ -216,14 +279,18 @@ namespace RoadGuard.CadParser.Services.Implementations
                     };
                 }
 
+                if (_cache != null && result != null && result.Success)
+                {
+                    _cache.Set(cacheKey, result, new MemoryCacheEntryOptions
+                    {
+                        SlidingExpiration = DefaultCacheTtl,
+                        Size = 2
+                    });
+                }
                 return result;
             }
             finally
             {
-                if (File.Exists(tempFile))
-                {
-                    try { File.Delete(tempFile); } catch { /* best-effort cleanup */ }
-                }
             }
         }
 
@@ -403,13 +470,19 @@ namespace RoadGuard.CadParser.Services.Implementations
                 "Starting DXF parse: file={FileName}, size={Size}B, srid={Srid}, tessSegs={Segs}, layer={Layer}, cm={Cm}, k0={K0}, axis={Axis}",
                 file.FileName, file.Length, srid, tessellationSegments, centerlineLayerName ?? "(auto-detect)", centralMeridian, scaleFactor, axisOrder);
 
-            var tempFile = Path.Combine(Path.GetTempPath(), $"{Guid.NewGuid():N}.dxf");
+            var fileHash = await ComputeFileSha256Async(file, cancellationToken).ConfigureAwait(false);
+            var invDxf = System.Globalization.CultureInfo.InvariantCulture;
+            var cacheKey = $"DXF_{fileHash}_{srid}_{tessellationSegments}_{segmentLength.ToString("F2", invDxf)}_{roadWidth.ToString("F2", invDxf)}_{slabLength.ToString("F2", invDxf)}_{centerlineLayerName ?? "AUTO"}_{centralMeridian?.ToString("F4", invDxf) ?? "AUTO"}_{scaleFactor?.ToString("F6", invDxf) ?? "AUTO"}_{axisOrder ?? "AUTO"}";
+
+            if (_cache != null && _cache.TryGetValue(cacheKey, out GeoJsonResponse? cachedDxf) && cachedDxf != null)
+            {
+                _logger.LogInformation("MemoryCache HIT for ParseDxf (Key={Key})", cacheKey);
+                return cachedDxf;
+            }
+
+            var tempFile = await EnsureDxfOnDiskAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
             try
             {
-                await using (var fs = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None))
-                {
-                    await file.CopyToAsync(fs, cancellationToken).ConfigureAwait(false);
-                }
 
                 // ?? Try Python Bridge first for heavy & modern CAD ingestion ? //
                 PythonParseResult? pyParseResult = null;
@@ -572,7 +645,7 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                     await PersistToDatabaseAsync(file.FileName, srid, feats, cancellationToken).ConfigureAwait(false);
 
-                    return new GeoJsonResponse
+                    var pyResponse = new GeoJsonResponse
                     {
                         SourceFileName      = file.FileName,
                         Srid                = srid,
@@ -582,6 +655,15 @@ namespace RoadGuard.CadParser.Services.Implementations
                         Warnings            = warns,
                         Analytics           = engAnalytics
                     };
+                    if (_cache != null)
+                    {
+                        _cache.Set(cacheKey, pyResponse, new MemoryCacheEntryOptions
+                        {
+                            SlidingExpiration = DefaultCacheTtl,
+                            Size = 2
+                        });
+                    }
+                    return pyResponse;
                 }
 
                 // ?? Fallback to legacy netDxf parsing ????????????????????????? //
@@ -721,7 +803,7 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                 await PersistToDatabaseAsync(file.FileName, srid, features, cancellationToken).ConfigureAwait(false);
 
-                return new GeoJsonResponse
+                var netDxfResponse = new GeoJsonResponse
                 {
                     SourceFileName      = file.FileName,
                     Srid                = srid,
@@ -731,13 +813,18 @@ namespace RoadGuard.CadParser.Services.Implementations
                     Warnings            = warnings,
                     Analytics           = analytics
                 };
+                if (_cache != null)
+                {
+                    _cache.Set(cacheKey, netDxfResponse, new MemoryCacheEntryOptions
+                    {
+                        SlidingExpiration = DefaultCacheTtl,
+                        Size = 2
+                    });
+                }
+                return netDxfResponse;
             }
             finally
             {
-                if (File.Exists(tempFile))
-                {
-                    try { File.Delete(tempFile); } catch { }
-                }
             }
         }
 

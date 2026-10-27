@@ -14,7 +14,10 @@ if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+import functools
 import ezdxf
+ezdxf.options.load_proxy_graphics = False
+ezdxf.options.preserve_proxy_graphics = False
 from ezdxf import path as dxf_path
 from ezdxf.addons.drawing.properties import Filling
 
@@ -174,6 +177,7 @@ def detect_central_meridian(x: float, y: float = None) -> float:
     else:            return 111.0
 
 
+@functools.lru_cache(maxsize=32)
 def make_vn2000_transformer(cm: float, scale_factor: float = 0.9999):
     k0 = _normalize_scale_factor(scale_factor)
     proj = (
@@ -186,6 +190,7 @@ def make_vn2000_transformer(cm: float, scale_factor: float = 0.9999):
     return Transformer.from_crs(CRS.from_proj4(proj), CRS.from_epsg(4326), always_xy=True)
 
 
+@functools.lru_cache(maxsize=32)
 def make_wgs84_to_vn2000_transformer(cm: float, scale_factor: float = 0.9999):
     k0 = _normalize_scale_factor(scale_factor)
     proj = (
@@ -546,38 +551,65 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
 
     chosen_layer = None
     layer_raw = {}
-    for entity, xform in walk_entities(msp, doc):
-        if entity.dxftype() not in LINEAR_TYPES:
-            continue
-        lyr = entity.dxf.get("layer", "0")
-        all_layers.add(lyr)
-        pts = entity_to_wcs_points(entity, xform)
-        if pts and len(pts) >= 2:
-            elev = 0.0
-            try:
-                elev = float(entity.dxf.get("elevation", 0.0))
-            except Exception:
-                pass
-            layer_raw.setdefault(lyr, []).append({
-                "points": pts,
-                "elevation": elev,
-                "type": entity.dxftype()
-            })
+    target_clean = target_layer.strip().upper() if (target_layer and target_layer.strip()) else None
 
-    if target_layer:
-        if target_layer in layer_raw:
-            chosen_layer = target_layer
+    # Performance fast path: if target_layer is specified, only extract entities matching target_layer
+    if target_clean:
+        for entity, xform in walk_entities(msp, doc):
+            if entity.dxftype() not in LINEAR_TYPES:
+                continue
+            lyr = entity.dxf.get("layer", "0")
+            all_layers.add(lyr)
+            if lyr.upper() == target_clean:
+                pts = entity_to_wcs_points(entity, xform)
+                if pts and len(pts) >= 2:
+                    elev = 0.0
+                    try:
+                        elev = float(entity.dxf.get("elevation", 0.0))
+                    except Exception:
+                        pass
+                    layer_raw.setdefault(lyr, []).append({
+                        "points": pts,
+                        "elevation": elev,
+                        "type": entity.dxftype()
+                    })
+        if layer_raw:
+            chosen_layer = next(iter(layer_raw.keys()))
+
+    if not chosen_layer:
+        # Full scan when no target_layer or target_layer not found in early filter
+        for entity, xform in walk_entities(msp, doc):
+            if entity.dxftype() not in LINEAR_TYPES:
+                continue
+            lyr = entity.dxf.get("layer", "0")
+            all_layers.add(lyr)
+            pts = entity_to_wcs_points(entity, xform)
+            if pts and len(pts) >= 2:
+                elev = 0.0
+                try:
+                    elev = float(entity.dxf.get("elevation", 0.0))
+                except Exception:
+                    pass
+                layer_raw.setdefault(lyr, []).append({
+                    "points": pts,
+                    "elevation": elev,
+                    "type": entity.dxftype()
+                })
+
+        if target_layer:
+            if target_layer in layer_raw:
+                chosen_layer = target_layer
+            else:
+                for l in layer_raw:
+                    if l.lower() == target_layer.lower():
+                        chosen_layer = l
+                        break
+            if not chosen_layer:
+                auto, _, _ = _detect_centerline_layer(msp, doc)
+                chosen_layer = auto
         else:
-            for l in layer_raw:
-                if l.lower() == target_layer.lower():
-                    chosen_layer = l
-                    break
-        if not chosen_layer:
             auto, _, _ = _detect_centerline_layer(msp, doc)
             chosen_layer = auto
-    else:
-        auto, _, _ = _detect_centerline_layer(msp, doc)
-        chosen_layer = auto
 
     if not chosen_layer:
         return {

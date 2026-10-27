@@ -1,0 +1,60 @@
+{
+  "imports": {
+    "ezdxf_ms": 402.4,
+    "pyproj_ms": 69.0,
+    "shapely_ms": 24.8,
+    "total_import_ms": 496.2
+  },
+  "files": [
+    {
+      "name": "sample_road.dxf",
+      "size_mb": 0.02,
+      "entities": 2,
+      "t_readfile_ms": 18.3,
+      "t_detect_ms": 0.2,
+      "t_parse_road_ms": 27.6,
+      "t_extract_geom_ms": 20.3,
+      "peak_mem_mb": 0.6
+    },
+    {
+      "name": "binh do dieu chinh lan 1.dxf",
+      "size_mb": 0.39,
+      "entities": 500,
+      "t_readfile_ms": 241.5,
+      "t_detect_ms": 14.2,
+      "t_parse_road_ms": 375.5,
+      "t_extract_geom_ms": 342.1,
+      "peak_mem_mb": 6.6
+    },
+    {
+      "name": "ROAD_CENTERLINE.dxf",
+      "size_mb": 6.81,
+      "entities": 7020,
+      "t_readfile_ms": 4678.6,
+      "t_detect_ms": 950.7,
+      "t_parse_road_ms": 6254.6,
+      "t_extract_geom_ms": 6266.7,
+      "peak_mem_mb": 70.5
+    },
+    {
+      "name": "3. BDTK.dxf",
+      "size_mb": 10.47,
+      "entities": 7447,
+      "t_readfile_ms": 6696.0,
+      "t_detect_ms": 1612.5,
+      "t_parse_road_ms": 9341.3,
+      "t_extract_geom_ms": 12381.4,
+      "peak_mem_mb": 96.8
+    },
+    {
+      "name": "BINH DO THIET KE PK.dxf",
+      "size_mb": 18.94,
+      "entities": 23745,
+      "t_readfile_ms": 18907.0,
+      "t_detect_ms": 645.1,
+      "t_parse_road_ms": 21544.7,
+      "t_extract_geom_ms": 21192.8,
+      "peak_mem_mb": 225.7
+    }
+  ]
+}

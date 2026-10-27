@@ -32,6 +32,12 @@ builder.Logging.AddDebug();
 
 // ── CAD Parser services (core DI registrations) ──────────────────────────── //
 // Scoped: CadParserService is stateless per-request; safe for concurrent use.
+// In-Memory Caching for DXF geometry and parsed models (LRU bounded)
+builder.Services.AddMemoryCache(options =>
+{
+    options.SizeLimit = 200;
+});
+
 builder.Services.AddScoped<ICadParserService, CadParserService>();
 
 // EF Core + SQL Server with NetTopologySuite spatial extension //
