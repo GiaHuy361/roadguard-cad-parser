@@ -35,20 +35,30 @@ except ImportError:
 # Configuration
 # =============================================================================
 
+EXCLUDE_KEYWORDS = [
+    "TEXT", "DIM", "KICHTHUOC", "KHUNG", "TEN", "BANG",
+    "GHI_CHU", "NOTE", "HATCH", "DOT", "BOU", "RANH", "GIOI"
+]
+
 CENTERLINE_KEYWORDS = [
-    "TKDTIMTUYEN", "TIM_THIET_KE", "TIMTHIETKE", "TIMTUYEN", "TIM_TUYEN",
-    "TIMDUONG", "TIM_DUONG", "CENTERLINE", "CENTER_LINE", "ROAD_AXIS", "ROAD_CENTER",
-    "DUONG_TIM", "TIM", "AXIS", "ALIG", "ALIGNMENT", "ENTPLINETUYEN"
+    "TKDTIMTUYEN", "TIM_THIET_KE", "TIMTHIETKE", "YEUTOCONGTUYEN", "YEUTOCONG",
+    "CONGTUYEN", "TIMTUYEN", "TIM_TUYEN", "TIMDUONG", "TIM_DUONG", "CENTERLINE",
+    "CENTER_LINE", "ROAD_AXIS", "ROAD_CENTER", "DUONG_TIM", "TIM", "AXIS",
+    "ALIG", "ALIGNMENT", "ENTPLINETUYEN"
 ]
 
 def score_centerline_layer(name: str) -> int:
     u = name.upper()
     if any(ex in u for ex in EXCLUDE_KEYWORDS):
         return -100
+    if "TUNHIEN" in u or "TDTUNHIEN" in u or "DIAHINH" in u or "DIATUNHIEN" in u:
+        return 10
     if "TKDTIMTUYEN" in u:
         return 1000
     if "TIM_THIET_KE" in u or "TIMTHIETKE" in u:
         return 900
+    if "YEUTOCONG" in u or "CONGTUYEN" in u:
+        return 850
     if "TIMTUYEN" in u or "TIM_TUYEN" in u:
         return 800
     if "TIMDUONG" in u or "TIM_DUONG" in u:
@@ -57,16 +67,14 @@ def score_centerline_layer(name: str) -> int:
         return 600
     if "TIM" in u and "DAUTIM" not in u and "SUON" not in u:
         return 500
+    if "ENTTDTHIETKE" in u or "THIET_KE" in u or "THIETKE" in u:
+        return 400
     if "ENTPLINETUYEN" in u:
         return 100
     for kw in CENTERLINE_KEYWORDS:
         if kw.upper() in u:
             return 50
     return 0
-EXCLUDE_KEYWORDS = [
-    "TEXT", "DIM", "KICHTHUOC", "KHUNG", "TEN", "BANG",
-    "GHI_CHU", "NOTE", "HATCH", "DOT", "BOU", "RANH", "GIOI"
-]
 LINEAR_TYPES = {"LINE", "LWPOLYLINE", "POLYLINE", "ARC", "SPLINE", "CIRCLE"}
 MIN_CENTERLINE_LENGTH = 10.0
 ARC_TESSELLATION_STEPS = 64
@@ -1220,6 +1228,7 @@ def parse_road(
         "crsState": crs_state,
         "notice": notice,
         "candidateLayers": candidate_layers,
+        "centerlineLayerName": chosen_layer,
         "centerlineCad": [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in main_chain],
         "centerlineBranchesCad": [[[round(float(p[0]), 4), round(float(p[1]), 4)] for p in b] for b in raw_branches],
         "roadSurfacePolygonCad": [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in poly_coords]

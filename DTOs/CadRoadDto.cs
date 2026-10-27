@@ -123,6 +123,10 @@ namespace RoadGuard.CadParser.DTOs
         [JsonPropertyName("candidateLayers")]
         public List<CadCandidateLayerItem>? CandidateLayers { get; set; }
 
+        [JsonProperty("centerlineLayerName")]
+        [JsonPropertyName("centerlineLayerName")]
+        public string? CenterlineLayerName { get; set; }
+
         [JsonProperty("centerlineCad")]
         [JsonPropertyName("centerlineCad")]
         public List<List<double>>? CenterlineCad { get; set; }
