@@ -94,4 +94,36 @@ namespace RoadGuard.CadParser.DTOs
         public string Detail { get; init; } = string.Empty;
         public DateTime TimestampUtc { get; init; } = DateTime.UtcNow;
     }
+
+    /// <summary>
+    /// Thrown when the instance-wide heavy CAD processing queue is full or wait time expired.
+    /// Maps to retryable HTTP 503 Service Unavailable with Retry-After header.
+    /// </summary>
+    public sealed class CadServerBusyException : Exception
+    {
+        public int RetryAfterSeconds { get; }
+
+        public CadServerBusyException(string message, int retryAfterSeconds = 10)
+            : base(message)
+        {
+            RetryAfterSeconds = Math.Max(1, retryAfterSeconds);
+        }
+    }
+
+    /// <summary>
+    /// Thrown when the Python CAD subprocess is killed (e.g. OOM / SIGKILL), crashes with non-zero exit,
+    /// or exceeds the per-task execution timeout. Must fail closed without falling back to in-process netDxf.
+    /// </summary>
+    public sealed class CadSubprocessTerminatedException : Exception
+    {
+        public bool IsTimeout { get; }
+        public int? ExitCode { get; }
+
+        public CadSubprocessTerminatedException(string message, bool isTimeout, int? exitCode = null, Exception? inner = null)
+            : base(message, inner)
+        {
+            IsTimeout = isTimeout;
+            ExitCode = exitCode;
+        }
+    }
 }

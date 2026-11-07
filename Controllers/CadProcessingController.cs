@@ -118,6 +118,33 @@ namespace RoadGuard.CadParser.Controllers
             _logger        = logger        ?? throw new ArgumentNullException(nameof(logger));
         }
 
+        private IActionResult BuildBusyResult(CadServerBusyException ex, string endpoint)
+        {
+            _logger.LogWarning(ex, "{Endpoint} rejected due to heavy-task queue saturation/timeout.", endpoint);
+            Response.Headers["Retry-After"] = ex.RetryAfterSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return StatusCode(StatusCodes.Status503ServiceUnavailable, new CadParserErrorResponse
+            {
+                StatusCode = StatusCodes.Status503ServiceUnavailable,
+                Error      = "ServerBusy",
+                Detail     = ex.Message
+            });
+        }
+
+        private IActionResult BuildSubprocessTerminatedResult(CadSubprocessTerminatedException ex, string endpoint)
+        {
+            _logger.LogError(ex, "{Endpoint} Python subprocess terminated abnormally (timeout={IsTimeout}, exitCode={ExitCode}).",
+                endpoint, ex.IsTimeout, ex.ExitCode);
+            Response.Headers["Retry-After"] = "5";
+            var statusCode = ex.IsTimeout ? StatusCodes.Status504GatewayTimeout : StatusCodes.Status503ServiceUnavailable;
+            var errorCode  = ex.IsTimeout ? "ProcessingTimeout" : "SubprocessTerminated";
+            return StatusCode(statusCode, new CadParserErrorResponse
+            {
+                StatusCode = statusCode,
+                Error      = errorCode,
+                Detail     = ex.Message
+            });
+        }
+
         // ================================================================== //
         //  POST /api/cad/get-layers                                           //
         // ================================================================== //
@@ -133,6 +160,7 @@ namespace RoadGuard.CadParser.Controllers
         /// <response code="422">DXF file is corrupted or unparseable.</response>
         /// <response code="500">Internal server error.</response>
         [HttpPost("get-layers")]
+        [HeavyCadAdmission]
         [Consumes("multipart/form-data")]
         [RequestSizeLimit(104_857_600)]   // 100 MB
         [RequestFormLimits(MultipartBodyLengthLimit = 104_857_600)]
@@ -192,6 +220,14 @@ namespace RoadGuard.CadParser.Controllers
                     Detail     = ex.Message
                 });
             }
+            catch (CadServerBusyException ex)
+            {
+                return BuildBusyResult(ex, nameof(GetLayers));
+            }
+            catch (CadSubprocessTerminatedException ex)
+            {
+                return BuildSubprocessTerminatedResult(ex, nameof(GetLayers));
+            }
             catch (OperationCanceledException)
             {
                 _logger.LogInformation("GetLayers request was cancelled.");
@@ -231,6 +267,7 @@ namespace RoadGuard.CadParser.Controllers
         /// <response code="422">File is a valid DXF container but the content is corrupt or unparseable.</response>
         /// <response code="500">Unexpected server-side failure.</response>
         [HttpPost("parse-dxf")]
+        [HeavyCadAdmission]
         [Consumes("multipart/form-data")]
         [RequestSizeLimit(104_857_600)]   // 100 MB
         [RequestFormLimits(MultipartBodyLengthLimit = 104_857_600)]
@@ -343,6 +380,14 @@ namespace RoadGuard.CadParser.Controllers
                     Detail     = ex.Message
                 });
             }
+            catch (CadServerBusyException ex)
+            {
+                return BuildBusyResult(ex, nameof(ParseDxf));
+            }
+            catch (CadSubprocessTerminatedException ex)
+            {
+                return BuildSubprocessTerminatedResult(ex, nameof(ParseDxf));
+            }
             catch (OperationCanceledException)
             {
                 _logger.LogInformation("ParseDxf request was cancelled.");
@@ -373,6 +418,7 @@ namespace RoadGuard.CadParser.Controllers
         /// <response code="200">Returns GPS coordinates for centerline, road surface polygon, and bounds.</response>
         /// <response code="400">If the uploaded file is missing or invalid.</response>
         [HttpPost("parse-road")]
+        [HeavyCadAdmission]
         [Consumes("multipart/form-data")]
         [Produces("application/json")]
         [ProducesResponseType(typeof(CadParseRoadResponse), StatusCodes.Status200OK)]
@@ -413,6 +459,39 @@ namespace RoadGuard.CadParser.Controllers
                 }
 
                 return Ok(result);
+            }
+            catch (ArgumentException ex) when (ex.Message.Contains("empty") || ex.Message.Contains("exceeds"))
+            {
+                _logger.LogWarning(ex, "Bad file argument in ParseRoad.");
+                return BadRequest(new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.BadRequest,
+                    Error      = "InvalidFile",
+                    Detail     = ex.Message
+                });
+            }
+            catch (NotSupportedException ex)
+            {
+                _logger.LogWarning(ex, "Unsupported file extension in ParseRoad.");
+                return StatusCode(StatusCodes.Status415UnsupportedMediaType, new CadParserErrorResponse
+                {
+                    StatusCode = (int)HttpStatusCode.UnsupportedMediaType,
+                    Error      = "UnsupportedFileType",
+                    Detail     = ex.Message
+                });
+            }
+            catch (CadServerBusyException ex)
+            {
+                return BuildBusyResult(ex, nameof(ParseRoad));
+            }
+            catch (CadSubprocessTerminatedException ex)
+            {
+                return BuildSubprocessTerminatedResult(ex, nameof(ParseRoad));
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("ParseRoad request was cancelled.");
+                return StatusCode(StatusCodes.Status499ClientClosedRequest);
             }
             catch (Exception ex)
             {
@@ -485,6 +564,19 @@ namespace RoadGuard.CadParser.Controllers
 
                 return Ok(result);
             }
+            catch (CadServerBusyException ex)
+            {
+                return BuildBusyResult(ex, nameof(ParseCoords));
+            }
+            catch (CadSubprocessTerminatedException ex)
+            {
+                return BuildSubprocessTerminatedResult(ex, nameof(ParseCoords));
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("ParseCoords request was cancelled.");
+                return StatusCode(StatusCodes.Status499ClientClosedRequest);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Unhandled exception during ParseCoords.");
@@ -509,6 +601,7 @@ namespace RoadGuard.CadParser.Controllers
         /// <response code="200">Returns WGS-84 Leaflet bounds and base64 PNG data.</response>
         /// <response code="400">If the uploaded file is missing or invalid.</response>
         [HttpPost("render-overlay")]
+        [HeavyCadAdmission]
         [Consumes("multipart/form-data")]
         [Produces("application/json")]
         [ProducesResponseType(typeof(CadRenderOverlayResponse), StatusCodes.Status200OK)]
@@ -541,6 +634,19 @@ namespace RoadGuard.CadParser.Controllers
                     cancellationToken).ConfigureAwait(false);
 
                 return Ok(result);
+            }
+            catch (CadServerBusyException ex)
+            {
+                return BuildBusyResult(ex, nameof(RenderOverlay));
+            }
+            catch (CadSubprocessTerminatedException ex)
+            {
+                return BuildSubprocessTerminatedResult(ex, nameof(RenderOverlay));
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("RenderOverlay request was cancelled.");
+                return StatusCode(StatusCodes.Status499ClientClosedRequest);
             }
             catch (Exception ex)
             {
@@ -661,6 +767,19 @@ namespace RoadGuard.CadParser.Controllers
                 var resultJson = await _parserService.TransformCrsAsync(rawJson, cancellationToken).ConfigureAwait(false);
                 return Content(resultJson, "application/json");
             }
+            catch (CadServerBusyException ex)
+            {
+                return BuildBusyResult(ex, nameof(TransformCrs));
+            }
+            catch (CadSubprocessTerminatedException ex)
+            {
+                return BuildSubprocessTerminatedResult(ex, nameof(TransformCrs));
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("TransformCrs request was cancelled.");
+                return StatusCode(StatusCodes.Status499ClientClosedRequest);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Unexpected error during TransformCrs.");
@@ -703,6 +822,19 @@ namespace RoadGuard.CadParser.Controllers
                 var resultJson = await _parserService.ExportRoadGuardDraftAsync(rawJson, cancellationToken).ConfigureAwait(false);
                 return Content(resultJson, "application/json");
             }
+            catch (CadServerBusyException ex)
+            {
+                return BuildBusyResult(ex, nameof(ExportRoadGuardDraft));
+            }
+            catch (CadSubprocessTerminatedException ex)
+            {
+                return BuildSubprocessTerminatedResult(ex, nameof(ExportRoadGuardDraft));
+            }
+            catch (OperationCanceledException)
+            {
+                _logger.LogInformation("ExportRoadGuardDraft request was cancelled.");
+                return StatusCode(StatusCodes.Status499ClientClosedRequest);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Unexpected error during ExportRoadGuardDraft.");
@@ -723,7 +855,12 @@ namespace RoadGuard.CadParser.Controllers
                 status = "healthy",
                 service = "RoadGuard.CadParser",
                 utc = DateTime.UtcNow,
-                activeLeases = RoadGuard.CadParser.Services.Implementations.CadParserService.ActiveLeaseCount
+                activeLeases = RoadGuard.CadParser.Services.Implementations.CadParserService.ActiveLeaseCount,
+                activeHeavyTasks = RoadGuard.CadParser.Services.Implementations.CadParserService.ActiveHeavyTaskCount,
+                queuedHeavyTasks = RoadGuard.CadParser.Services.Implementations.CadParserService.QueuedHeavyWaiterCount,
+                quarantinedHeavyTasks = RoadGuard.CadParser.Services.Implementations.CadParserService.QuarantinedHeavyTaskCount,
+                inFlightHeavyRequests = RoadGuard.CadParser.Services.Implementations.HeavyRequestAdmission.InFlight,
+                heavyAdmissionCapacity = RoadGuard.CadParser.Services.Implementations.HeavyRequestAdmission.Capacity
             });
     }
 }

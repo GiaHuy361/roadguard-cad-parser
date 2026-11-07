@@ -14,7 +14,7 @@ RUN apt-get update \
 
 # Virtualenv exposes `python` (the backend spawns `python cad_bridge.py ...`)
 RUN python3 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH" MPLBACKEND=Agg
+ENV PATH="/opt/venv/bin:$PATH" MPLBACKEND=Agg OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.IO;
@@ -82,10 +82,42 @@ namespace RoadGuard.CadParser.Services.Implementations
         private static readonly TimeSpan DefaultSlidingTtl = TimeSpan.FromMinutes(15);
         private static readonly TimeSpan DefaultAbsoluteTtl = TimeSpan.FromHours(1);
 
-        private const long MaxDiskCacheBytes = 250L * 1024 * 1024;    // 250 MB
-        private const long TargetDiskCacheBytes = 180L * 1024 * 1024; // 180 MB
+        private static readonly long MaxDiskCacheBytes =
+            Math.Clamp(ReadEnvLong("MAX_DISK_CACHE_MB", 64L), 16L, 1024L) * 1024L * 1024L;
+        private static readonly long TargetDiskCacheBytes =
+            Math.Min(
+                MaxDiskCacheBytes,
+                Math.Clamp(ReadEnvLong("TARGET_DISK_CACHE_MB", 40L), 8L, 1024L) * 1024L * 1024L);
         private static readonly TimeSpan DiskCacheFileTtl = TimeSpan.FromMinutes(30);
         private static long _lastDiskCleanupTicks;
+
+        // ── Instance-wide heavy CAD execution & bounded wait-queue gate ───── //
+        internal static readonly int MaxHeavyParseConcurrency =
+            (int)Math.Clamp(ReadEnvLong("MAX_HEAVY_PARSE_CONCURRENCY", 1L), 1L, 16L);
+        internal static readonly int MaxHeavyQueueWaiters =
+            (int)Math.Clamp(ReadEnvLong("MAX_HEAVY_PARSE_QUEUE", 3L), 0L, 64L);
+        private static readonly TimeSpan HeavyQueueWaitTimeout =
+            ReadEnvDuration("HEAVY_PARSE_QUEUE_TIMEOUT_MS", "HEAVY_PARSE_QUEUE_TIMEOUT_SECONDS", 45_000L);
+        // Per-Python-process execution budget. The clock starts only AFTER the heavy slot is held and the
+        // process is about to start: it does NOT include upload, hashing, queue wait or post-processing.
+        private static readonly TimeSpan HeavyExecutionTimeout =
+            ReadEnvDuration("HEAVY_PARSE_EXECUTION_TIMEOUT_MS", "HEAVY_PARSE_EXECUTION_TIMEOUT_SECONDS", 180_000L);
+        // How long we keep killing / polling before declaring the child "not confirmed dead" (slot is then quarantined).
+        private static readonly TimeSpan KillConfirmTimeout =
+            ReadEnvDuration("HEAVY_PARSE_KILL_CONFIRM_TIMEOUT_MS", "HEAVY_PARSE_KILL_CONFIRM_TIMEOUT_SECONDS", 10_000L);
+
+        private static readonly SemaphoreSlim _heavyExecutionGate =
+            new(MaxHeavyParseConcurrency, MaxHeavyParseConcurrency);
+        private static int _activeHeavyTasks;
+        private static int _queuedHeavyWaiters;
+        private static int _quarantinedHeavyTasks;
+
+        public static int ActiveHeavyTaskCount => Volatile.Read(ref _activeHeavyTasks);
+        public static int QueuedHeavyWaiterCount => Volatile.Read(ref _queuedHeavyWaiters);
+        public static int QuarantinedHeavyTaskCount => Volatile.Read(ref _quarantinedHeavyTasks);
+
+        /// <summary>Factory for the Python child process (replaceable in resilience tests only).</summary>
+        internal Func<ProcessStartInfo, IChildProcess> ProcessFactory { get; set; } = si => new SystemChildProcess(si);
 
         // Bounded striped locks (64 stripes) to prevent dictionary memory leaks
         private static readonly SemaphoreSlim[] _diskStripeLocks = Enumerable.Range(0, 64)
@@ -101,6 +133,119 @@ namespace RoadGuard.CadParser.Services.Implementations
         {
             // Proactively clean up any stale staging files on application startup
             SweepOrphanStagingFiles();
+        }
+
+        private static long ReadEnvLong(string name, long defaultValue)
+        {
+            var raw = Environment.GetEnvironmentVariable(name);
+            return !string.IsNullOrWhiteSpace(raw) && long.TryParse(raw.Trim(), out var parsed)
+                ? parsed
+                : defaultValue;
+        }
+
+        private static TimeSpan ReadEnvDuration(string msVarName, string secVarName, long defaultMs)
+        {
+            var rawMs = Environment.GetEnvironmentVariable(msVarName);
+            if (!string.IsNullOrWhiteSpace(rawMs) && long.TryParse(rawMs.Trim(), out var ms) && ms > 0)
+            {
+                return TimeSpan.FromMilliseconds(Math.Clamp(ms, 100L, 600_000L));
+            }
+            var rawSec = Environment.GetEnvironmentVariable(secVarName);
+            if (!string.IsNullOrWhiteSpace(rawSec) && long.TryParse(rawSec.Trim(), out var sec) && sec > 0)
+            {
+                return TimeSpan.FromSeconds(Math.Clamp(sec, 1L, 600L));
+            }
+            return TimeSpan.FromMilliseconds(defaultMs);
+        }
+
+        /// <summary>
+        /// Holds one heavy-execution slot. States: 0 = held, 1 = quarantined (the Python child could not be
+        /// confirmed dead, so the slot must NOT be reused), 2 = released. <see cref="Dispose"/> only releases
+        /// a slot that is still in state 0, so an outer <c>using</c> can never free a quarantined slot.
+        /// </summary>
+        internal sealed class HeavyParseSlotLease : IDisposable
+        {
+            private int _state;
+
+            public bool IsQuarantined => Volatile.Read(ref _state) == 1;
+
+            public void Dispose()
+            {
+                if (Interlocked.CompareExchange(ref _state, 2, 0) == 0)
+                {
+                    Interlocked.Decrement(ref _activeHeavyTasks);
+                    _heavyExecutionGate.Release();
+                }
+            }
+
+            internal bool TryQuarantine()
+            {
+                if (Interlocked.CompareExchange(ref _state, 1, 0) == 0)
+                {
+                    Interlocked.Increment(ref _quarantinedHeavyTasks);
+                    return true;
+                }
+                return false;
+            }
+
+            internal void ReleaseAfterChildExit()
+            {
+                if (Interlocked.CompareExchange(ref _state, 2, 1) == 1)
+                {
+                    Interlocked.Decrement(ref _quarantinedHeavyTasks);
+                    Interlocked.Decrement(ref _activeHeavyTasks);
+                    _heavyExecutionGate.Release();
+                }
+            }
+        }
+
+        internal static async Task<HeavyParseSlotLease> AcquireHeavyParseSlotAsync(CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // Every slot is blocked by a child process that could not be confirmed dead: fail fast instead of
+            // letting requests sit in the queue (and hold their upload on disk) for the whole wait timeout.
+            if (QuarantinedHeavyTaskCount >= MaxHeavyParseConcurrency)
+            {
+                throw new CadServerBusyException(
+                    "Máy chủ đang dọn tiến trình xử lý CAD cũ chưa thoát hẳn; chưa nhận tác vụ mới. Vui lòng thử lại sau ít giây.",
+                    retryAfterSeconds: 30);
+            }
+
+            if (_heavyExecutionGate.Wait(0))
+            {
+                Interlocked.Increment(ref _activeHeavyTasks);
+                return new HeavyParseSlotLease();
+            }
+
+            var queuedNow = Interlocked.Increment(ref _queuedHeavyWaiters);
+            if (queuedNow > MaxHeavyQueueWaiters)
+            {
+                Interlocked.Decrement(ref _queuedHeavyWaiters);
+                throw new CadServerBusyException(
+                    $"Máy chủ đang xử lý tối đa tác vụ CAD nặng ({queuedNow - 1}/{MaxHeavyQueueWaiters} yêu cầu đang chờ). Vui lòng thử lại sau ít giây.",
+                    retryAfterSeconds: 10);
+            }
+
+            bool entered = false;
+            try
+            {
+                entered = await _heavyExecutionGate.WaitAsync(HeavyQueueWaitTimeout, ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Decrement(ref _queuedHeavyWaiters);
+            }
+
+            if (!entered)
+            {
+                throw new CadServerBusyException(
+                    $"Yêu cầu chờ slot xử lý CAD vượt quá {(int)Math.Ceiling(HeavyQueueWaitTimeout.TotalSeconds)} giây do máy chủ đang bận. Vui lòng thử lại.",
+                    retryAfterSeconds: 10);
+            }
+
+            Interlocked.Increment(ref _activeHeavyTasks);
+            return new HeavyParseSlotLease();
         }
 
         // ------------------------------------------------------------------ //
@@ -160,6 +305,7 @@ namespace RoadGuard.CadParser.Services.Implementations
 
         private static void ReleaseLease(string path, string fileHash)
         {
+            bool releasedLast = false;
             var lockObj = GetStripeLock(fileHash);
             lockObj.Wait();
             try
@@ -169,6 +315,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                     if (count <= 1)
                     {
                         _activeFileLeases.TryRemove(path, out _);
+                        releasedLast = true;
                     }
                     else
                     {
@@ -179,6 +326,11 @@ namespace RoadGuard.CadParser.Services.Implementations
             finally
             {
                 lockObj.Release();
+            }
+
+            if (releasedLast)
+            {
+                _ = Task.Run(() => EnforceDiskCacheCapacity(force: false, bypassThrottle: true));
             }
         }
 
@@ -195,9 +347,9 @@ namespace RoadGuard.CadParser.Services.Implementations
             catch { }
         }
 
-        public static void EnforceDiskCacheCapacity(bool force = false)
+        public static void EnforceDiskCacheCapacity(bool force = false, bool bypassThrottle = false)
         {
-            if (!force)
+            if (!force && !bypassThrottle)
             {
                 var nowTicks = Environment.TickCount64;
                 var last = Interlocked.Read(ref _lastDiskCleanupTicks);
@@ -289,6 +441,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             var lockObj = GetStripeLock(fileHash);
             await lockObj.WaitAsync(ct).ConfigureAwait(false);
             string? stagingPath = null;
+            bool wroteNewFile = false;
             FileDiskLease lease;
             try
             {
@@ -303,6 +456,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                         }
                         File.Move(stagingPath, targetPath, overwrite: true);
                         stagingPath = null;
+                        wroteNewFile = true;
                     }
                     finally
                     {
@@ -322,8 +476,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                 lockObj.Release();
             }
 
-            // Non-blocking background capacity check
-            _ = Task.Run(() => EnforceDiskCacheCapacity());
+            // Non-blocking background capacity check (bypass 5s throttle when a new DXF entered /tmp)
+            _ = Task.Run(() => EnforceDiskCacheCapacity(force: false, bypassThrottle: wroteNewFile));
             return lease;
         }
 
@@ -346,6 +500,14 @@ namespace RoadGuard.CadParser.Services.Implementations
                 return cachedLayers;
             }
 
+            // Take the heavy slot BEFORE copying the upload into /tmp: queued requests then hold only their
+            // (ASP.NET-buffered) form file, not a second rg_ copy.
+            using var heavySlot = await AcquireHeavyParseSlotAsync(cancellationToken).ConfigureAwait(false);
+            if (_cache != null && _cache.TryGetValue(cacheKey, out List<string>? cachedLayersAfterWait) && cachedLayersAfterWait != null)
+            {
+                return cachedLayersAfterWait;
+            }
+
             using var lease = await AcquireDxfOnDiskLeaseAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
             var tempFile = lease.FilePath;
             try
@@ -353,7 +515,7 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                 try
                 {
-                    var json = await RunPythonBridgeAsync($"get-layers \"{tempFile}\"", cancellationToken).ConfigureAwait(false);
+                    var json = await RunPythonBridgeAsync($"get-layers \"{tempFile}\"", cancellationToken, heavySlot).ConfigureAwait(false);
                     var pyRes = Newtonsoft.Json.JsonConvert.DeserializeObject<PythonLayersResult>(json);
                     if (pyRes is not null && pyRes.Success && pyRes.Layers.Count > 0)
                     {
@@ -373,24 +535,26 @@ namespace RoadGuard.CadParser.Services.Implementations
                 {
                     throw;
                 }
+                catch (CadServerBusyException)
+                {
+                    throw;
+                }
+                catch (CadSubprocessTerminatedException)
+                {
+                    throw;
+                }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Python bridge get-layers failed; falling back to netDxf.");
+                    _logger.LogWarning(ex, "Python bridge get-layers unavailable; falling back to netDxf.");
                 }
 
-                // Fallback to netDxf
-                using var stream = new MemoryStream();
-                await using (var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read))
-                {
-                    await fs.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
-                }
-                stream.Position = 0;
-
+                // Fallback to netDxf (same heavy slot as above, streaming directly from the disk file without MemoryStream copy)
                 return await Task.Run(() =>
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    var dxfDoc = LoadDxfDocument(stream, file.FileName);
+                    using var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    var dxfDoc = LoadDxfDocument(fs, file.FileName);
                     if (dxfDoc is null)
                     {
                         throw new InvalidOperationException(
@@ -457,6 +621,13 @@ namespace RoadGuard.CadParser.Services.Implementations
                 return cachedRoad;
             }
 
+            using var heavySlot = await AcquireHeavyParseSlotAsync(cancellationToken).ConfigureAwait(false);
+            if (_cache != null && _cache.TryGetValue(cacheKey, out CadParseRoadResponse? cachedRoadAfterWait) && cachedRoadAfterWait != null)
+            {
+                _logger.LogInformation("MemoryCache HIT for ParseRoad after queue wait (Key={Key})", cacheKey);
+                return cachedRoadAfterWait;
+            }
+
             using var lease = await AcquireDxfOnDiskLeaseAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
             var tempFile = lease.FilePath;
             try
@@ -479,7 +650,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                     bridgeArgs += $" --axis-order \"{axisOrder.Trim()}\"";
                 }
 
-                var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+                var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken, heavySlot).ConfigureAwait(false);
                 var result = Newtonsoft.Json.JsonConvert.DeserializeObject<CadParseRoadResponse>(json);
                 if (result is null || !result.Success)
                 {
@@ -626,6 +797,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             ValidateFile(file);
 
             var fileHash = await ComputeFileSha256Async(file, cancellationToken).ConfigureAwait(false);
+            using var heavySlot = await AcquireHeavyParseSlotAsync(cancellationToken).ConfigureAwait(false);
             using var lease = await AcquireDxfOnDiskLeaseAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
             var tempFile = lease.FilePath;
 
@@ -635,7 +807,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                 bridgeArgs += $" --layer \"{centerlineLayerName}\"";
             }
 
-            var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+            var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken, heavySlot).ConfigureAwait(false);
             var result = Newtonsoft.Json.JsonConvert.DeserializeObject<CadRenderOverlayResponse>(json);
             if (result is null || !result.Success)
             {
@@ -687,6 +859,17 @@ namespace RoadGuard.CadParser.Services.Implementations
                 return cachedDxf;
             }
 
+            bool isGeoreferencedRequest =
+                srid == 4326 &&
+                (centralMeridian.HasValue || scaleFactor.HasValue || !string.IsNullOrWhiteSpace(axisOrder));
+
+            using var heavySlot = await AcquireHeavyParseSlotAsync(cancellationToken).ConfigureAwait(false);
+            if (_cache != null && _cache.TryGetValue(cacheKey, out GeoJsonResponse? cachedDxfAfterWait) && cachedDxfAfterWait != null)
+            {
+                _logger.LogInformation("MemoryCache HIT for ParseDxf after queue wait (Key={Key})", cacheKey);
+                return cachedDxfAfterWait;
+            }
+
             using var lease = await AcquireDxfOnDiskLeaseAsync(file, fileHash, cancellationToken).ConfigureAwait(false);
             var tempFile = lease.FilePath;
             try
@@ -715,17 +898,26 @@ namespace RoadGuard.CadParser.Services.Implementations
                         bridgeArgs += $" --axis-order \"{axisOrder.Trim()}\"";
                     }
 
-                    var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken).ConfigureAwait(false);
+                    var json = await RunPythonBridgeAsync(bridgeArgs, cancellationToken, heavySlot).ConfigureAwait(false);
                     pyParseResult = Newtonsoft.Json.JsonConvert.DeserializeObject<PythonParseResult>(json);
                 }
                 catch (OperationCanceledException)
                 {
                     throw;
                 }
+                catch (CadServerBusyException)
+                {
+                    throw;
+                }
+                catch (CadSubprocessTerminatedException)
+                {
+                    throw;
+                }
                 catch (Exception ex)
                 {
                     var msg = ex.Message;
-                    if (msg.Contains("pyproj", StringComparison.OrdinalIgnoreCase) ||
+                    if (isGeoreferencedRequest ||
+                        msg.Contains("pyproj", StringComparison.OrdinalIgnoreCase) ||
                         msg.Contains("ScaleFactor", StringComparison.OrdinalIgnoreCase) ||
                         msg.Contains("CRS", StringComparison.OrdinalIgnoreCase) ||
                         msg.Contains("projection", StringComparison.OrdinalIgnoreCase) ||
@@ -734,10 +926,16 @@ namespace RoadGuard.CadParser.Services.Implementations
                         msg.Contains("InvalidScaleFactor", StringComparison.OrdinalIgnoreCase))
                     {
                         _logger.LogError(ex, "Python bridge geodetic/CRS operation failed. Fail-closed: refusing netDxf fallback.");
-                        throw;
+                        if (ex is InvalidOperationException)
+                        {
+                            throw;
+                        }
+                        throw new InvalidOperationException(
+                            "Không thể định vị GIS WGS-84/VN-2000 bằng bộ phân tích dự phòng netDxf do thiếu thư viện trắc địa Python Bridge. Yêu cầu Python Bridge để chuyển đổi tọa độ VN-2000.",
+                            ex);
                     }
 
-                    _logger.LogWarning(ex, "Python bridge parse failed or threw exception; attempting netDxf fallback for local CAD only.");
+                    _logger.LogWarning(ex, "Python bridge unavailable for non-georeferenced request; attempting netDxf fallback for Local CAD 2D only.");
                 }
 
                 if (pyParseResult is not null)
@@ -880,19 +1078,22 @@ namespace RoadGuard.CadParser.Services.Implementations
                     return pyResponse;
                 }
 
-                // ?? Fallback to legacy netDxf parsing ????????????????????????? //
-                using var stream = new MemoryStream();
-                await using (var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read))
+                // ── Fail-closed georeferenced guard BEFORE any stream copy or netDxf load ── //
+                if (isGeoreferencedRequest)
                 {
-                    await fs.CopyToAsync(stream, cancellationToken).ConfigureAwait(false);
+                    throw new InvalidOperationException(
+                        "Không thể định vị GIS WGS-84/VN-2000 bằng bộ phân tích dự phòng netDxf do thiếu thư viện trắc địa Python Bridge. Yêu cầu Python Bridge để chuyển đổi tọa độ VN-2000.");
                 }
-                stream.Position = 0;
+
+                // ── Fallback to legacy netDxf parsing (Local CAD 2D non-georeferenced only) ── //
+                // (runs under the same heavy slot acquired at the top of this method)
 
                 var (features, warnings, featuresByLayer, analytics) = await Task.Run(() =>
                 {
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    var dxfDoc = LoadDxfDocument(stream, file.FileName);
+                    using var fs = new FileStream(tempFile, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    var dxfDoc = LoadDxfDocument(fs, file.FileName);
                     if (dxfDoc is null)
                         throw new InvalidOperationException(
                             $"DxfDocument.Load returned null for '{file.FileName}'. The file may be empty or corrupted.");
@@ -932,13 +1133,6 @@ namespace RoadGuard.CadParser.Services.Implementations
                     var feats   = new List<Feature>();
                     var warns   = new List<string>();
                     var byLayer = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-
-                    // Step 2.5: Fail-closed guard for georeferenced requests
-                    if (srid == 4326 && (centralMeridian.HasValue || scaleFactor.HasValue || !string.IsNullOrWhiteSpace(axisOrder)))
-                    {
-                        throw new InvalidOperationException(
-                            "Không thể định vị GIS WGS-84/VN-2000 bằng bộ phân tích dự phòng netDxf do thiếu thư viện trắc địa Python Bridge. Yêu cầu Python Bridge để chuyển đổi tọa độ VN-2000.");
-                    }
 
                     warns.Add("Bản vẽ được nạp bằng bộ phân tích dự phòng netDxf ở chế độ tọa độ phẳng cục bộ (Local CAD 2D) không có định vị GIS quốc gia VN-2000.");
 
@@ -1044,7 +1238,121 @@ namespace RoadGuard.CadParser.Services.Implementations
             }
         }
 
-        private async Task<string> RunPythonBridgeAsync(string arguments, CancellationToken cancellationToken)
+        private static bool TryHasExited(IChildProcess process, ILogger logger)
+        {
+            try
+            {
+                return process.HasExited;
+            }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "Could not read HasExited for Python child process; treating it as NOT exited.");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Kills the child and keeps polling until the OS reports it has exited, or <paramref name="timeout"/> elapses.
+        /// Returns true ONLY when exit is confirmed. Kill failures / wait failures never count as success.
+        /// </summary>
+        internal static async Task<bool> ConfirmChildExitedAsync(IChildProcess process, TimeSpan timeout, ILogger logger)
+        {
+            var sw = Stopwatch.StartNew();
+            var attempt = 0;
+            while (true)
+            {
+                if (TryHasExited(process, logger)) return true;
+
+                attempt++;
+                try
+                {
+                    process.Kill();
+                }
+                catch (Exception ex)
+                {
+                    logger.LogWarning(ex, "Kill of Python child failed (attempt {Attempt}).", attempt);
+                }
+
+                var remaining = timeout - sw.Elapsed;
+                var wait = remaining <= TimeSpan.Zero
+                    ? TimeSpan.FromMilliseconds(50)
+                    : TimeSpan.FromMilliseconds(Math.Min(200, remaining.TotalMilliseconds));
+                using (var cts = new CancellationTokenSource(wait))
+                {
+                    try
+                    {
+                        await process.WaitForExitAsync(cts.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex, "WaitForExit on Python child failed (attempt {Attempt}).", attempt);
+                        await Task.Delay(50).ConfigureAwait(false);
+                    }
+                }
+
+                if (TryHasExited(process, logger)) return true;
+                if (sw.Elapsed >= timeout) return false;
+            }
+        }
+
+        /// <summary>
+        /// The child could not be confirmed dead: keep the slot locked (state = quarantined) and keep killing in the
+        /// background. The slot is returned to the gate ONLY after the OS confirms the process exited.
+        /// </summary>
+        private void QuarantineSlotUntilChildExits(IChildProcess process, HeavyParseSlotLease slot)
+        {
+            if (!slot.TryQuarantine()) return;
+
+            _logger.LogCritical(
+                "Python child process (pid {Pid}) could not be confirmed dead. Heavy slot is QUARANTINED; new work is refused until it exits.",
+                SafePid(process));
+
+            _ = Task.Run(async () =>
+            {
+                while (true)
+                {
+                    try
+                    {
+                        if (await ConfirmChildExitedAsync(process, TimeSpan.FromSeconds(5), _logger).ConfigureAwait(false))
+                        {
+                            break;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Quarantine reaper iteration failed; retrying.");
+                    }
+                    await Task.Delay(1000).ConfigureAwait(false);
+                }
+
+                try { process.Dispose(); } catch { }
+                slot.ReleaseAfterChildExit();
+                _logger.LogWarning("Quarantined Python child exited; heavy slot released.");
+            });
+        }
+
+        private static int SafePid(IChildProcess process)
+        {
+            try { return process.Id; } catch { return -1; }
+        }
+
+        private static void Observe(Task task)
+        {
+            _ = task.ContinueWith(t => { _ = t.Exception; }, TaskContinuationOptions.OnlyOnFaulted);
+        }
+
+        /// <summary>
+        /// Runs the Python bridge. If <paramref name="heldSlot"/> is supplied the caller already owns the heavy slot
+        /// (and disposes it); otherwise a slot is acquired here. Either way the slot is never reusable until the child
+        /// process has been confirmed exited (otherwise it is quarantined, see <see cref="QuarantineSlotUntilChildExits"/>).
+        /// </summary>
+        internal async Task<string> RunPythonBridgeAsync(
+            string arguments,
+            CancellationToken cancellationToken,
+            HeavyParseSlotLease? heldSlot = null)
         {
             var scriptPath = Path.Combine(Directory.GetCurrentDirectory(), "Services", "PythonBridge", "cad_bridge.py");
             if (!File.Exists(scriptPath))
@@ -1057,6 +1365,30 @@ namespace RoadGuard.CadParser.Services.Implementations
                 throw new FileNotFoundException($"Python bridge script not found at '{scriptPath}'.");
             }
 
+            HeavyParseSlotLease? ownSlot = null;
+            var slot = heldSlot;
+            if (slot is null)
+            {
+                ownSlot = await AcquireHeavyParseSlotAsync(cancellationToken).ConfigureAwait(false);
+                slot = ownSlot;
+            }
+
+            try
+            {
+                return await RunPythonProcessAsync(scriptPath, arguments, slot, cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                ownSlot?.Dispose(); // no-op when the slot was quarantined
+            }
+        }
+
+        private async Task<string> RunPythonProcessAsync(
+            string scriptPath,
+            string arguments,
+            HeavyParseSlotLease slot,
+            CancellationToken cancellationToken)
+        {
             var startInfo = new ProcessStartInfo
             {
                 FileName = "python",
@@ -1069,48 +1401,88 @@ namespace RoadGuard.CadParser.Services.Implementations
                 CreateNoWindow = true
             };
 
-            using var process = new Process { StartInfo = startInfo };
-            process.Start();
+            // Execution budget for THIS Python process only (starts now, after the slot is held).
+            using var execTimeoutCts = new CancellationTokenSource(HeavyExecutionTimeout);
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, execTimeoutCts.Token);
 
-            var outputTask = process.StandardOutput.ReadToEndAsync();
-            var errorTask = process.StandardError.ReadToEndAsync();
-
+            IChildProcess? process = null;
+            var started = false;
+            var handedToReaper = false;
             try
             {
-                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
+                process = ProcessFactory(startInfo);
+                process.Start();
+                started = true;
+
+                var outputTask = process.StandardOutput.ReadToEndAsync();
+                var errorTask = process.StandardError.ReadToEndAsync();
+                Observe(outputTask);
+                Observe(errorTask);
+
                 try
                 {
-                    if (!process.HasExited)
+                    await process.WaitForExitAsync(linkedCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    var callerCancelled = cancellationToken.IsCancellationRequested;
+                    var childGone = await ConfirmChildExitedAsync(process, KillConfirmTimeout, _logger).ConfigureAwait(false);
+                    if (!childGone)
                     {
-                        process.Kill(entireProcessTree: true);
-                        using var killCts = new CancellationTokenSource(3000);
-                        try
-                        {
-                            await process.WaitForExitAsync(killCts.Token).ConfigureAwait(false);
-                        }
-                        catch { }
+                        QuarantineSlotUntilChildExits(process, slot);
+                        handedToReaper = true;
+                    }
+
+                    if (callerCancelled)
+                    {
+                        throw new OperationCanceledException(cancellationToken);
+                    }
+
+                    throw new CadSubprocessTerminatedException(
+                        childGone
+                            ? $"Tiến trình xử lý CAD Python vượt quá giới hạn thời gian ({HeavyExecutionTimeout.TotalSeconds:0.#} giây) và đã bị dừng an toàn."
+                            : $"Tiến trình xử lý CAD Python vượt quá giới hạn thời gian ({HeavyExecutionTimeout.TotalSeconds:0.#} giây) nhưng CHƯA xác nhận đã thoát; máy chủ khóa slot xử lý cho tới khi tiến trình thoát hẳn.",
+                        isTimeout: true);
+                }
+
+                var output = await outputTask.ConfigureAwait(false);
+                var error = await errorTask.ConfigureAwait(false);
+
+                if (process.ExitCode != 0 && string.IsNullOrWhiteSpace(output))
+                {
+                    var errSummary = string.IsNullOrWhiteSpace(error)
+                        ? $"exit code {process.ExitCode} (tiến trình con bị dừng bất thường / SIGKILL / hết RAM)"
+                        : error.Trim();
+                    throw new CadSubprocessTerminatedException(
+                        $"Tiến trình xử lý CAD Python kết thúc bất thường: {errSummary}",
+                        isTimeout: false,
+                        exitCode: process.ExitCode);
+                }
+
+                return output;
+            }
+            finally
+            {
+                if (!handedToReaper)
+                {
+                    // Every other exit path (success, error, exception): the slot may be reused only once the
+                    // child is confirmed gone. If it is not, quarantine instead of releasing.
+                    var childGone = true;
+                    if (process is not null && started)
+                    {
+                        childGone = await ConfirmChildExitedAsync(process, KillConfirmTimeout, _logger).ConfigureAwait(false);
+                    }
+
+                    if (childGone)
+                    {
+                        try { process?.Dispose(); } catch { }
+                    }
+                    else
+                    {
+                        QuarantineSlotUntilChildExits(process!, slot);
                     }
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Failed to kill Python child process on cancellation.");
-                }
-
-                throw;
             }
-
-            var output = await outputTask.ConfigureAwait(false);
-            var error = await errorTask.ConfigureAwait(false);
-
-            if (process.ExitCode != 0 && string.IsNullOrWhiteSpace(output))
-            {
-                throw new InvalidOperationException($"Python bridge failed: {error}");
-            }
-
-            return output;
         }
 
         private sealed class PythonLayersResult
