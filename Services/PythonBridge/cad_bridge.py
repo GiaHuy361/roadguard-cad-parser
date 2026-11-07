@@ -28,7 +28,7 @@ except ImportError:
     HAS_PYPROJ = False
 
 try:
-    from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon
+    from shapely.geometry import LineString, MultiLineString, Polygon, MultiPolygon, Point
     from shapely.ops import unary_union, linemerge
     HAS_SHAPELY = True
 except ImportError:
@@ -60,20 +60,20 @@ def score_centerline_layer(name: str) -> int:
         return 1000
     if "TIM_THIET_KE" in u or "TIMTHIETKE" in u:
         return 900
-    if "YEUTOCONG" in u or "CONGTUYEN" in u:
-        return 850
+    if "ENTPLINETUYEN" in u:
+        return 880
     if "TIMTUYEN" in u or "TIM_TUYEN" in u:
         return 800
     if "TIMDUONG" in u or "TIM_DUONG" in u:
         return 700
+    if "YEUTOCONG" in u or "CONGTUYEN" in u:
+        return 650
     if "CENTERLINE" in u or "ROAD_AXIS" in u or "ROAD_CENTER" in u:
         return 600
     if "TIM" in u and "DAUTIM" not in u and "SUON" not in u:
         return 500
     if "ENTTDTHIETKE" in u or "THIET_KE" in u or "THIETKE" in u:
         return 400
-    if "ENTPLINETUYEN" in u:
-        return 100
     for kw in CENTERLINE_KEYWORDS:
         if kw.upper() in u:
             return 50
@@ -951,31 +951,49 @@ def parse_road(
         return (p[0], p[1])
 
     # 1. Collect linear entities directly from modelspace with bulge & arc tessellation
-    primary_lines = []
+    # Exclude closed ring entities (callout table frames, traffic islands, manholes) when open alignment entities exist.
+    def _is_closed_ring_entity(ent, fixed_pts, min_eps):
+        if ent.dxftype() == "CIRCLE":
+            return True
+        if getattr(ent, "closed", False) or getattr(ent, "is_closed", False):
+            return True
+        ring_tol = max(min_eps * 2.0, 1e-6 if min_eps < 1e-4 else 0.05)
+        if len(fixed_pts) >= 4 and math.hypot(fixed_pts[0][0] - fixed_pts[-1][0], fixed_pts[0][1] - fixed_pts[-1][1]) <= ring_tol:
+            return True
+        return False
+
+    open_primary_lines = []
+    closed_primary_lines = []
+    open_entity_polylines = []
+
+    def _collect_entity_segments(ent, raw_pts):
+        if not raw_pts or len(raw_pts) < 2:
+            return
+        fixed_pts = [_normalize_cad_pt(p) for p in raw_pts]
+        is_deg = abs(fixed_pts[0][0]) <= 180.0 and abs(fixed_pts[0][1]) <= 90.0
+        min_seg_eps = 1e-7 if is_deg else 0.01
+        is_closed_ent = _is_closed_ring_entity(ent, fixed_pts, min_seg_eps)
+        target_bucket = closed_primary_lines if is_closed_ent else open_primary_lines
+        filtered_chain = [fixed_pts[0]]
+        for i in range(len(fixed_pts) - 1):
+            if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > min_seg_eps:
+                target_bucket.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
+                filtered_chain.append(fixed_pts[i+1])
+        if not is_closed_ent and len(filtered_chain) >= 2:
+            open_entity_polylines.append(filtered_chain)
+
     for e in msp:
         if e.dxf.layer.upper() == chosen_layer.upper():
-            pts = entity_to_wcs_points(e)
-            if pts and len(pts) >= 2:
-                fixed_pts = [_normalize_cad_pt(p) for p in pts]
-                is_deg = abs(fixed_pts[0][0]) <= 180.0 and abs(fixed_pts[0][1]) <= 90.0
-                min_seg_eps = 1e-7 if is_deg else 0.01
-                for i in range(len(fixed_pts) - 1):
-                    if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > min_seg_eps:
-                        primary_lines.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
+            _collect_entity_segments(e, entity_to_wcs_points(e))
 
-    if not primary_lines:
+    if not open_primary_lines and not closed_primary_lines:
         for entity, xform in walk_entities(msp, doc):
             if entity.dxftype() in LINEAR_TYPES:
                 lyr = entity.dxf.get("layer", "")
                 if lyr.upper() == chosen_layer.upper():
-                    pts = entity_to_wcs_points(entity, xform)
-                    if pts and len(pts) >= 2:
-                        fixed_pts = [_normalize_cad_pt(p) for p in pts]
-                        is_deg = abs(fixed_pts[0][0]) <= 180.0 and abs(fixed_pts[0][1]) <= 90.0
-                        min_seg_eps = 1e-7 if is_deg else 0.01
-                        for i in range(len(fixed_pts) - 1):
-                            if math.hypot(fixed_pts[i+1][0] - fixed_pts[i][0], fixed_pts[i+1][1] - fixed_pts[i][1]) > min_seg_eps:
-                                primary_lines.append(LineString([fixed_pts[i], fixed_pts[i+1]]))
+                    _collect_entity_segments(entity, entity_to_wcs_points(entity, xform))
+
+    primary_lines = open_primary_lines if open_primary_lines else closed_primary_lines
 
     if not primary_lines:
         return {
@@ -1019,6 +1037,7 @@ def parse_road(
 
         full_cluster = list(main_cluster)
         current_net = clean_main
+        attached_junction_branch = False
         changed = True
         while changed:
             changed = False
@@ -1027,6 +1046,7 @@ def parse_road(
                 if current_net.distance(ls) < 2.5:
                     full_cluster.append(ls)
                     current_net = unary_union(full_cluster)
+                    attached_junction_branch = True
                     changed = True
                 else:
                     still_cands.append(ls)
@@ -1046,116 +1066,257 @@ def parse_road(
         tot_len = full_net.length * (111320.0 if is_degree_dxf else 1.0)
         surface_area_sqm = round(float(poly_main.area * ((111320.0 ** 2) if is_degree_dxf else 1.0)), 2)
 
-        cl_merged = linemerge(full_net) if full_net.geom_type == 'MultiLineString' else full_net
-        if hasattr(cl_merged, 'geoms'):
-            min_branch_l = (0.5 / 111320.0) if is_degree_dxf else 0.5
-            raw_branches = [list(g.coords) for g in cl_merged.geoms if g.length > min_branch_l]
+        close_tol = (0.05 / 111320.0) if is_degree_dxf else 0.05
+        parallel_tol = (12.0 / 111320.0) if is_degree_dxf else 12.0
+        uturn_tol = (10.0 / 111320.0) if is_degree_dxf else 10.0
+        dedup_eps = 1e-11 if is_degree_dxf else 1e-9
+
+        def _is_simple_open_chain(pts):
+            if not pts or len(pts) < 2:
+                return False
+            dedup = [pts[0]]
+            for pt in pts[1:]:
+                if math.hypot(pt[0] - dedup[-1][0], pt[1] - dedup[-1][1]) > dedup_eps:
+                    dedup.append(pt)
+            if len(dedup) < 2:
+                return False
+            if len(dedup) >= 3 and math.hypot(dedup[0][0] - dedup[-1][0], dedup[0][1] - dedup[-1][1]) <= close_tol:
+                return False
+            ls_chk = LineString(dedup)
+            return bool(ls_chk.is_valid and ls_chk.is_simple and ls_chk.length > 0)
+
+        # If the CAD layer contains a single standalone open polyline that genuinely self-intersects in CAD,
+        # preserve its exact vertex sequence rather than planarizing/hiding the CAD defect so downstream
+        # RoadGuard GeometryEngine validation accurately detects and reports the CAD self-intersection.
+        if (
+            len(open_entity_polylines) == 1
+            and not attached_junction_branch
+            and not _is_simple_open_chain(open_entity_polylines[0])
+        ):
+            single_cad_chain = list(open_entity_polylines[0])
+            main_chain = single_cad_chain
+            raw_branches = []
+            tot_len = sum(
+                math.hypot(single_cad_chain[i+1][0] - single_cad_chain[i][0], single_cad_chain[i+1][1] - single_cad_chain[i][1])
+                for i in range(len(single_cad_chain) - 1)
+            ) * (111320.0 if is_degree_dxf else 1.0)
         else:
-            raw_branches = [list(cl_merged.coords)]
-
-        def chain_longest_corridor(branches):
-            def calc_len(pts):
-                raw_l = sum(math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) for i in range(len(pts) - 1))
-                return raw_l * (111320.0 if is_degree_dxf else 1.0)
-
-            if not branches:
-                return [], [], 0.0
-            if len(branches) == 1:
-                b0 = branches[0]
-                if b0 and b0[0][0] > b0[-1][0]:
-                    b0 = b0[::-1]
-                return b0, [], calc_len(b0)
-
-            n = len(branches)
-            best_chain = []
-            best_len = -1
-            best_indices = set()
-
-            for start_i in range(n):
-                for start_rev in [False, True]:
-                    b_start = branches[start_i][::-1] if start_rev else branches[start_i]
-                    curr_pts = list(b_start)
-                    used = {start_i}
-                    while True:
-                        last_pt = curr_pts[-1]
-                        prev_pt = curr_pts[-2] if len(curr_pts) >= 2 else None
-                        best_cand = None
-                        best_cand_d = 999.0
-                        best_cand_rev = False
-
-                        for j in range(n):
-                            if j in used: continue
-                            bj = branches[j]
-                            d_start = math.hypot(bj[0][0] - last_pt[0], bj[0][1] - last_pt[1])
-                            d_end = math.hypot(bj[-1][0] - last_pt[0], bj[-1][1] - last_pt[1])
-                            if d_start < 2.5:
-                                if prev_pt and len(bj) >= 2:
-                                    v_in = (last_pt[0] - prev_pt[0], last_pt[1] - prev_pt[1])
-                                    v_out = (bj[1][0] - bj[0][0], bj[1][1] - bj[0][1])
-                                    l_in = math.hypot(*v_in); l_out = math.hypot(*v_out)
-                                    if l_in > 0 and l_out > 0:
-                                        dot = (v_in[0]*v_out[0] + v_in[1]*v_out[1]) / (l_in * l_out)
-                                        if dot < -0.5: continue
-                                if d_start < best_cand_d:
-                                    best_cand_d = d_start; best_cand = j; best_cand_rev = False
-                            elif d_end < 2.5:
-                                if prev_pt and len(bj) >= 2:
-                                    v_in = (last_pt[0] - prev_pt[0], last_pt[1] - prev_pt[1])
-                                    v_out = (bj[-2][0] - bj[-1][0], bj[-2][1] - bj[-1][1])
-                                    l_in = math.hypot(*v_in); l_out = math.hypot(*v_out)
-                                    if l_in > 0 and l_out > 0:
-                                        dot = (v_in[0]*v_out[0] + v_in[1]*v_out[1]) / (l_in * l_out)
-                                        if dot < -0.5: continue
-                                if d_end < best_cand_d:
-                                    best_cand_d = d_end; best_cand = j; best_cand_rev = True
-
-                        if best_cand is not None:
-                            bj = branches[best_cand]
-                            pts_to_add = bj[::-1] if best_cand_rev else bj
-                            curr_pts.extend(pts_to_add[1:])
-                            used.add(best_cand)
-                        else:
-                            break
-
-                    total_l = calc_len(curr_pts)
-                    if total_l > best_len:
-                        best_len = total_l
-                        best_chain = curr_pts
-                        best_indices = set(used)
-
-            if best_chain and best_chain[0][0] > best_chain[-1][0]:
-                best_chain = best_chain[::-1]
-
-            remaining = [branches[i] for i in range(n) if i not in best_indices]
-            genuine_branches = []
-            if best_chain and len(best_chain) >= 2 and HAS_SHAPELY:
-                main_ls = LineString(best_chain)
-                for b in remaining:
-                    if calc_len(b) >= 15.0:
-                        b_ls = LineString(b)
-                        min_d = main_ls.distance(b_ls)
-                        max_d = max(main_ls.distance(LineString([p, p])) for p in b)
-                        if min_d <= 3.0 and max_d >= 8.0:
-                            genuine_branches.append(b)
-
-                deduped = []
-                for b in sorted(genuine_branches, key=calc_len, reverse=True):
-                    b_ls = LineString(b)
-                    if not any(LineString(existing).distance(b_ls) < 2.0 for existing in deduped):
-                        deduped.append(b)
-                genuine_branches = deduped
+            cl_merged = linemerge(full_net) if full_net.geom_type == 'MultiLineString' else full_net
+            if hasattr(cl_merged, 'geoms'):
+                min_branch_l = (0.5 / 111320.0) if is_degree_dxf else 0.5
+                raw_branches = [list(g.coords) for g in cl_merged.geoms if g.length > min_branch_l]
             else:
-                genuine_branches = [b for b in remaining if calc_len(b) >= 15.0]
+                raw_branches = [list(cl_merged.coords)]
 
-            return best_chain, genuine_branches, best_len
+            # Exclude closed sub-loops (e.g. multi-segment triangular curb islands) when open branches exist
+            open_raw_branches = [b for b in raw_branches if _is_simple_open_chain(b)]
+            if open_raw_branches:
+                raw_branches = open_raw_branches
 
-        chained_main, remaining_branches, chained_len = chain_longest_corridor(raw_branches)
-        if chained_main and len(chained_main) >= 2:
-            main_chain = chained_main
-            raw_branches = remaining_branches
-            tot_len = chained_len
-        else:
-            main_chain = raw_branches[0] if raw_branches else []
+            def chain_longest_corridor(branches):
+                def calc_len(pts):
+                    raw_l = sum(math.hypot(pts[i+1][0] - pts[i][0], pts[i+1][1] - pts[i][1]) for i in range(len(pts) - 1))
+                    return raw_l * (111320.0 if is_degree_dxf else 1.0)
+
+                if not branches:
+                    return [], [], 0.0
+                if len(branches) == 1:
+                    b0 = branches[0]
+                    if b0 and b0[0][0] > b0[-1][0]:
+                        b0 = b0[::-1]
+                    return b0, [], calc_len(b0)
+
+                n = len(branches)
+                best_chain = []
+                best_len = -1
+                best_indices = set()
+
+                for start_i in range(n):
+                    for start_rev in [False, True]:
+                        b_start = branches[start_i][::-1] if start_rev else branches[start_i]
+                        if not _is_simple_open_chain(b_start):
+                            continue
+                        curr_pts = list(b_start)
+                        used = {start_i}
+                        while True:
+                            last_pt = curr_pts[-1]
+                            prev_pt = curr_pts[-2] if len(curr_pts) >= 2 else None
+                            curr_len_m = calc_len(curr_pts)
+                            best_cand = None
+                            best_cand_d = 999.0
+                            best_cand_rev = False
+
+                            for j in range(n):
+                                if j in used:
+                                    continue
+                                bj = branches[j]
+                                d_start = math.hypot(bj[0][0] - last_pt[0], bj[0][1] - last_pt[1])
+                                d_end = math.hypot(bj[-1][0] - last_pt[0], bj[-1][1] - last_pt[1])
+
+                                for is_rev, dist_val in ((False, d_start), (True, d_end)):
+                                    if dist_val >= 2.5 or dist_val >= best_cand_d:
+                                        continue
+                                    pts_to_add = bj[::-1] if is_rev else bj
+                                    if prev_pt and len(pts_to_add) >= 2:
+                                        v_in = (last_pt[0] - prev_pt[0], last_pt[1] - prev_pt[1])
+                                        v_out = (pts_to_add[1][0] - pts_to_add[0][0], pts_to_add[1][1] - pts_to_add[0][1])
+                                        l_in = math.hypot(*v_in)
+                                        l_out = math.hypot(*v_out)
+                                        if l_in > 0 and l_out > 0:
+                                            dot = (v_in[0]*v_out[0] + v_in[1]*v_out[1]) / (l_in * l_out)
+                                            if dot < -0.5:
+                                                continue
+
+                                    # Prevent U-turning across sharp pavement end-caps back onto a parallel opposite carriageway edge,
+                                    # while preserving tangent-continuous curved hairpins / turnarounds.
+                                    cand_len_m = calc_len(pts_to_add)
+                                    if curr_len_m >= 25.0 and cand_len_m >= 15.0:
+                                        unit_scale = 111320.0 if is_degree_dxf else 1.0
+                                        acc_back = 0.0
+                                        body_pts = None
+                                        for idx_b in range(len(curr_pts) - 1, 0, -1):
+                                            p_hi = curr_pts[idx_b]
+                                            p_lo = curr_pts[idx_b - 1]
+                                            seg_m = math.hypot(p_hi[0] - p_lo[0], p_hi[1] - p_lo[1]) * unit_scale
+                                            if acc_back + seg_m >= 15.0 and seg_m > 0:
+                                                rem_m = 15.0 - acc_back
+                                                t_b = max(0.0, min(1.0, rem_m / seg_m))
+                                                cut_pt = (p_hi[0] + t_b * (p_lo[0] - p_hi[0]), p_hi[1] + t_b * (p_lo[1] - p_hi[1]))
+                                                prefix = list(curr_pts[:idx_b])
+                                                if not prefix or math.hypot(cut_pt[0] - prefix[-1][0], cut_pt[1] - prefix[-1][1]) * unit_scale > 0.01:
+                                                    prefix.append(cut_pt)
+                                                if len(prefix) >= 2:
+                                                    body_pts = prefix
+                                                break
+                                            acc_back += seg_m
+
+                                        if body_pts is not None:
+                                            body_ls = LineString(body_pts)
+                                            probe_target_m = min(25.0, cand_len_m)
+                                            acc_fwd = 0.0
+                                            probe_pt = pts_to_add[-1]
+                                            for k in range(len(pts_to_add) - 1):
+                                                p_a = pts_to_add[k]
+                                                p_b = pts_to_add[k + 1]
+                                                seg_m = math.hypot(p_b[0] - p_a[0], p_b[1] - p_a[1]) * unit_scale
+                                                if acc_fwd + seg_m >= probe_target_m and seg_m > 0:
+                                                    t_f = max(0.0, min(1.0, (probe_target_m - acc_fwd) / seg_m))
+                                                    probe_pt = (p_a[0] + t_f * (p_b[0] - p_a[0]), p_a[1] + t_f * (p_b[1] - p_a[1]))
+                                                    break
+                                                acc_fwd += seg_m
+
+                                            if body_ls.distance(Point(probe_pt)) < uturn_tol:
+                                                # Distinguish sharp end-cap corners (> ~53 deg, dot < 0.60) from smooth curved hairpins
+                                                tail_pts = [curr_pts[-1]]
+                                                acc_tail = 0.0
+                                                for idx_t in range(len(curr_pts) - 1, 0, -1):
+                                                    seg_t = math.hypot(
+                                                        curr_pts[idx_t][0] - curr_pts[idx_t - 1][0],
+                                                        curr_pts[idx_t][1] - curr_pts[idx_t - 1][1],
+                                                    ) * unit_scale
+                                                    tail_pts.append(curr_pts[idx_t - 1])
+                                                    acc_tail += seg_t
+                                                    if acc_tail >= 25.0:
+                                                        break
+                                                tail_pts.reverse()
+
+                                                head_pts = [pts_to_add[0]]
+                                                acc_head = 0.0
+                                                for idx_h in range(len(pts_to_add) - 1):
+                                                    seg_h = math.hypot(
+                                                        pts_to_add[idx_h + 1][0] - pts_to_add[idx_h][0],
+                                                        pts_to_add[idx_h + 1][1] - pts_to_add[idx_h][1],
+                                                    ) * unit_scale
+                                                    head_pts.append(pts_to_add[idx_h + 1])
+                                                    acc_head += seg_h
+                                                    if acc_head >= 15.0:
+                                                        break
+
+                                                def _collect_unit_vecs(chain_pts):
+                                                    vecs = []
+                                                    anchor = chain_pts[0]
+                                                    for nxt in chain_pts[1:]:
+                                                        dx = nxt[0] - anchor[0]
+                                                        dy = nxt[1] - anchor[1]
+                                                        lm = math.hypot(dx, dy) * unit_scale
+                                                        if lm >= 0.45:
+                                                            nrm = math.hypot(dx, dy)
+                                                            vecs.append((dx / nrm, dy / nrm))
+                                                            anchor = nxt
+                                                    if not vecs and len(chain_pts) >= 2:
+                                                        dx = chain_pts[-1][0] - chain_pts[0][0]
+                                                        dy = chain_pts[-1][1] - chain_pts[0][1]
+                                                        nrm = math.hypot(dx, dy)
+                                                        if nrm > 0:
+                                                            vecs.append((dx / nrm, dy / nrm))
+                                                    return vecs
+
+                                                turn_vecs = _collect_unit_vecs(tail_pts) + _collect_unit_vecs(head_pts)
+                                                min_turn_dot = 1.0
+                                                for vi_idx in range(len(turn_vecs) - 1):
+                                                    va = turn_vecs[vi_idx]
+                                                    vb = turn_vecs[vi_idx + 1]
+                                                    min_turn_dot = min(min_turn_dot, va[0] * vb[0] + va[1] * vb[1])
+                                                if min_turn_dot < 0.60:
+                                                    continue
+
+                                    # Never allow branch stitching to introduce self-intersections or closed loops
+                                    trial_pts = curr_pts + pts_to_add[1:]
+                                    if not _is_simple_open_chain(trial_pts):
+                                        continue
+
+                                    best_cand_d = dist_val
+                                    best_cand = j
+                                    best_cand_rev = is_rev
+
+                            if best_cand is not None:
+                                bj = branches[best_cand]
+                                pts_to_add = bj[::-1] if best_cand_rev else bj
+                                curr_pts.extend(pts_to_add[1:])
+                                used.add(best_cand)
+                            else:
+                                break
+
+                        total_l = calc_len(curr_pts)
+                        if total_l > best_len:
+                            best_len = total_l
+                            best_chain = curr_pts
+                            best_indices = set(used)
+
+                if best_chain and best_chain[0][0] > best_chain[-1][0]:
+                    best_chain = best_chain[::-1]
+
+                remaining = [branches[i] for i in range(n) if i not in best_indices]
+                genuine_branches = []
+                if best_chain and len(best_chain) >= 2 and HAS_SHAPELY:
+                    main_ls = LineString(best_chain)
+                    for b in remaining:
+                        if calc_len(b) >= 15.0 and _is_simple_open_chain(b):
+                            b_ls = LineString(b)
+                            min_d = main_ls.distance(b_ls)
+                            max_d = max(main_ls.distance(Point(p)) for p in b)
+                            near_ratio = sum(1 for p in b if main_ls.distance(Point(p)) < parallel_tol) / float(len(b))
+                            if min_d <= 3.0 and max_d >= 8.0 and near_ratio < 0.8:
+                                genuine_branches.append(b)
+
+                    deduped = []
+                    for b in sorted(genuine_branches, key=calc_len, reverse=True):
+                        b_ls = LineString(b)
+                        if not any(LineString(existing).distance(b_ls) < 2.0 for existing in deduped):
+                            deduped.append(b)
+                    genuine_branches = deduped
+                else:
+                    genuine_branches = [b for b in remaining if calc_len(b) >= 15.0]
+
+                return best_chain, genuine_branches, best_len
+
+            chained_main, remaining_branches, chained_len = chain_longest_corridor(raw_branches)
+            if chained_main and len(chained_main) >= 2:
+                main_chain = chained_main
+                raw_branches = remaining_branches
+                tot_len = chained_len
+            else:
+                main_chain = raw_branches[0] if raw_branches else []
 
         traffic_islands_geom = []
         island_layers = {'DAN_HUONG', 'DAO_TAM_GIAC', 'DAO_GIAO_THONG', 'THGT'}
