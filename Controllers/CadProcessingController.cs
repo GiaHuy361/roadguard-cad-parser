@@ -441,7 +441,7 @@ namespace RoadGuard.CadParser.Controllers
             {
                 var result = await _parserService.ParseRoadAsync(
                     request.File,
-                    request.RoadWidth > 0 ? request.RoadWidth : 7.0,
+                    request.RoadWidth > 0 ? request.RoadWidth : 0.0,
                     request.CenterlineLayerName,
                     request.CentralMeridian,
                     request.ScaleFactor,
@@ -546,7 +546,7 @@ namespace RoadGuard.CadParser.Controllers
             {
                 var result = await _parserService.ParseCoordsAsync(
                     request.Coordinates,
-                    request.RoadWidth > 0 ? request.RoadWidth : 7.0,
+                    request.RoadWidth > 0 ? request.RoadWidth : 0.0,
                     request.CentralMeridian,
                     request.ScaleFactor,
                     request.AxisOrder,

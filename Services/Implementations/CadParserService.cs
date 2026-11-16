@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.IO;
@@ -956,6 +956,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                         var itemCoords = item.GetCoordinates();
                         if (itemCoords == null || itemCoords.Count < 2) continue;
 
+                        double? explicitItemElev = item.Properties?.Elevation ?? item.Elevation;
                         var coords = new List<NtsCoordinate>();
                         foreach (var pt in itemCoords)
                         {
@@ -963,8 +964,15 @@ namespace RoadGuard.CadParser.Services.Implementations
                             {
                                 double x = pt[0];
                                 double y = pt[1];
-                                double z = pt.Count >= 3 ? pt[2] : (item.Properties?.Elevation ?? item.Elevation);
-                                coords.Add(new CoordinateZ(x, y, z));
+                                double? zVal = pt.Count >= 3 ? pt[2] : explicitItemElev;
+                                if (zVal.HasValue && !double.IsNaN(zVal.Value))
+                                {
+                                    coords.Add(new CoordinateZ(x, y, zVal.Value));
+                                }
+                                else
+                                {
+                                    coords.Add(new NtsCoordinate(x, y));
+                                }
                             }
                         }
 
@@ -972,12 +980,12 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                         var geom = ToGjsLineString(coords);
                         var segName = item.GetSegment() ?? $"SEG-{feats.Count + 1:D2}";
-                        var props = new Dictionary<string, object>
+                        var props = new Dictionary<string, object?>
                         {
                             ["layer"] = chosenCenterlineLayer,
                             ["layerName"] = chosenCenterlineLayer,
                             ["layerType"] = "Centerline",
-                            ["elevation"] = item.Properties?.Elevation ?? item.Elevation,
+                            ["elevation"] = explicitItemElev,
                             ["segment"] = segName
                         };
 
@@ -1503,7 +1511,7 @@ namespace RoadGuard.CadParser.Services.Implementations
         {
             public string? Layer { get; set; }
             public string? Segment { get; set; }
-            public double Elevation { get; set; }
+            public double? Elevation { get; set; }
         }
 
         private sealed class PythonFeatureData
@@ -1515,7 +1523,7 @@ namespace RoadGuard.CadParser.Services.Implementations
             // Flat/backward-compatibility fields
             public string Layer { get; set; } = string.Empty;
             public string? Segment { get; set; }
-            public double Elevation { get; set; }
+            public double? Elevation { get; set; }
             public List<List<double>>? Coordinates { get; set; }
 
             public List<List<double>> GetCoordinates()
@@ -1898,7 +1906,7 @@ namespace RoadGuard.CadParser.Services.Implementations
         private static GjsLineStr ToGjsLineString(IList<NtsCoordinate> coords)
         {
             var positions = coords
-                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
+                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? (double?)null : c.Z))
                 .ToList();
             return new GjsLineStr(positions);
         }
@@ -1910,7 +1918,7 @@ namespace RoadGuard.CadParser.Services.Implementations
         private static GjsPolygon ToGjsPolygon(IList<NtsCoordinate> coords)
         {
             var positions = coords
-                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
+                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? (double?)null : c.Z))
                 .ToList();
             // GeoJSON.Net Polygon takes a list of LineString rings
             var ring = new GjsLineStr(positions);
@@ -2140,8 +2148,11 @@ namespace RoadGuard.CadParser.Services.Implementations
                 if (feat.Geometry is not GjsLineStr lineStr || lineStr.Coordinates.Count < 2)
                     continue;
 
+                bool hasAnyAltitude = lineStr.Coordinates.Any(c => c.Altitude.HasValue);
                 var ntsCoords = lineStr.Coordinates
-                    .Select(c => (NtsCoordinate)new CoordinateZ(c.Longitude, c.Latitude, c.Altitude ?? 0.0))
+                    .Select(c => c.Altitude.HasValue
+                        ? (NtsCoordinate)new CoordinateZ(c.Longitude, c.Latitude, c.Altitude.Value)
+                        : new NtsCoordinate(c.Longitude, c.Latitude))
                     .ToArray();
                 var ntsLine = ntsFactory.CreateLineString(ntsCoords);
                 if (ntsLine.Length <= 1e-9) continue;
@@ -2157,25 +2168,39 @@ namespace RoadGuard.CadParser.Services.Implementations
 
                     var ptCoord = indexedLine.ExtractPoint(distNative);
 
-                    // Interpolate exact 3D Z elevation at distNative along the centerline
-                    double z = 0.0;
-                    double accumDist = 0.0;
-                    var coordsList = lineStr.Coordinates;
-                    for (int i = 1; i < coordsList.Count; i++)
+                    // Interpolate exact 3D Z elevation at distNative along the centerline ONLY when authentic Z exists
+                    double? z = null;
+                    if (hasAnyAltitude)
                     {
-                        double segDx = coordsList[i].Longitude - coordsList[i-1].Longitude;
-                        double segDy = coordsList[i].Latitude  - coordsList[i-1].Latitude;
-                        double segLen = Math.Sqrt(segDx * segDx + segDy * segDy);
-
-                        if (accumDist + segLen >= distNative - 1e-9 || i == coordsList.Count - 1)
+                        double accumDist = 0.0;
+                        var coordsList = lineStr.Coordinates;
+                        for (int i = 1; i < coordsList.Count; i++)
                         {
-                            double t = segLen > 1e-9 ? Math.Clamp((distNative - accumDist) / segLen, 0.0, 1.0) : 0.0;
-                            double z1 = coordsList[i-1].Altitude ?? 0.0;
-                            double z2 = coordsList[i].Altitude ?? z1;
-                            z = z1 + t * (z2 - z1);
-                            break;
+                            double segDx = coordsList[i].Longitude - coordsList[i-1].Longitude;
+                            double segDy = coordsList[i].Latitude  - coordsList[i-1].Latitude;
+                            double segLen = Math.Sqrt(segDx * segDx + segDy * segDy);
+
+                            if (accumDist + segLen >= distNative - 1e-9 || i == coordsList.Count - 1)
+                            {
+                                double t = segLen > 1e-9 ? Math.Clamp((distNative - accumDist) / segLen, 0.0, 1.0) : 0.0;
+                                if (coordsList[i-1].Altitude.HasValue && coordsList[i].Altitude.HasValue)
+                                {
+                                    double z1 = coordsList[i-1].Altitude!.Value;
+                                    double z2 = coordsList[i].Altitude!.Value;
+                                    z = z1 + t * (z2 - z1);
+                                }
+                                else if (t < 1e-6 && coordsList[i-1].Altitude.HasValue)
+                                {
+                                    z = coordsList[i-1].Altitude!.Value;
+                                }
+                                else if (Math.Abs(t - 1.0) < 1e-6 && coordsList[i].Altitude.HasValue)
+                                {
+                                    z = coordsList[i].Altitude!.Value;
+                                }
+                                break;
+                            }
+                            accumDist += segLen;
                         }
-                        accumDist += segLen;
                     }
 
                     var gjsPoint = new GjsPoint(new GjsPosition(ptCoord.Y, ptCoord.X, z));
@@ -2187,8 +2212,8 @@ namespace RoadGuard.CadParser.Services.Implementations
                         ["layerType"]        = "StationPoint",
                         ["stationName"]      = stationName,
                         ["distance"]         = Math.Round(distMeters, 2),
-                        ["averageElevation"] = Math.Round(z, 3),
-                        ["elevation"]        = Math.Round(z, 3),
+                        ["averageElevation"] = z.HasValue ? Math.Round(z.Value, 3) : null,
+                        ["elevation"]        = z.HasValue ? Math.Round(z.Value, 3) : null,
                         ["layerColor"]       = "#EF4444",
                         ["layerLineweight"]  = "default",
                         ["layerLinetype"]    = "CONTINUOUS",
@@ -2294,7 +2319,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                         if (ntsPoly.IsEmpty) return;
 
                         var shellCoords = ntsPoly.ExteriorRing.Coordinates
-                            .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
+                            .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? (double?)null : c.Z))
                             .ToList();
 
                         var rings = new List<GjsLineStr> { new GjsLineStr(shellCoords) };
@@ -2303,7 +2328,7 @@ namespace RoadGuard.CadParser.Services.Implementations
                         {
                             var hole = ntsPoly.GetInteriorRingN(i);
                             var holeCoords = hole.Coordinates
-                                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? 0.0 : c.Z))
+                                .Select(c => (GjsIPos)new GjsPosition(c.Y, c.X, double.IsNaN(c.Z) ? (double?)null : c.Z))
                                 .ToList();
                             rings.Add(new GjsLineStr(holeCoords));
                         }

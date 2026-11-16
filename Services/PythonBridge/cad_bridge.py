@@ -450,6 +450,80 @@ def entity_to_wcs_points(entity, transform=None):
     return pts
 
 
+def _extract_entity_authentic_elevation(entity):
+    """
+    Returns an explicit float elevation (including 0.0 when explicitly declared on the entity)
+    or None when the entity is a 2D DXF entity without authentic elevation data.
+    """
+    t = entity.dxftype()
+    try:
+        if t == "LWPOLYLINE":
+            if entity.dxf.hasattr("elevation"):
+                return round(float(entity.dxf.elevation), 3)
+            return None
+        elif t == "POLYLINE":
+            flags = int(entity.dxf.get("flags", 0)) if entity.dxf.hasattr("flags") else 0
+            is_3d_poly = bool(flags & 8)
+            zs = [float(v.dxf.location.z) for v in entity.vertices if v.dxf.hasattr("location")]
+            if is_3d_poly or any(abs(z) > 1e-6 for z in zs):
+                return round(sum(zs) / len(zs), 3) if zs else 0.0
+            return None
+        elif t == "LINE":
+            z0 = float(entity.dxf.start.z)
+            z1 = float(entity.dxf.end.z)
+            if abs(z0) > 1e-6 or abs(z1) > 1e-6:
+                return round((z0 + z1) / 2.0, 3)
+            return None
+        elif t in ("ARC", "CIRCLE"):
+            zc = float(entity.dxf.center.z)
+            if abs(zc) > 1e-6:
+                return round(zc, 3)
+            return None
+        elif t == "SPLINE":
+            cps = list(entity.control_points)
+            if cps and any(abs(float(cp[2])) > 1e-6 for cp in cps if len(cp) >= 3):
+                zs = [float(cp[2]) for cp in cps if len(cp) >= 3]
+                return round(sum(zs) / len(zs), 3)
+            return None
+    except Exception:
+        return None
+    return None
+
+
+def _extract_entity_vertex_z_pairs(entity):
+    """
+    Extracts list of ((x, y), z) for vertices that genuinely carry an authentic Z elevation
+    (including Z = 0.0 when explicitly declared via LWPOLYLINE group 38 or 3D POLYLINE).
+    Returns empty list for pure 2D entities.
+    """
+    t = entity.dxftype()
+    out = []
+    try:
+        if t == "LWPOLYLINE":
+            if entity.dxf.hasattr("elevation"):
+                z_val = round(float(entity.dxf.elevation), 3)
+                for x, y in entity.get_points("xy"):
+                    out.append(((float(x), float(y)), z_val))
+        elif t == "POLYLINE":
+            flags = int(entity.dxf.get("flags", 0)) if entity.dxf.hasattr("flags") else 0
+            is_3d_poly = bool(flags & 8)
+            verts = list(entity.vertices)
+            zs = [float(v.dxf.location.z) for v in verts if v.dxf.hasattr("location")]
+            if is_3d_poly or any(abs(z) > 1e-6 for z in zs):
+                for v in verts:
+                    loc = v.dxf.location
+                    out.append(((float(loc.x), float(loc.y)), round(float(loc.z), 3)))
+        elif t == "LINE":
+            z0 = float(entity.dxf.start.z)
+            z1 = float(entity.dxf.end.z)
+            if abs(z0) > 1e-6 or abs(z1) > 1e-6:
+                out.append(((float(entity.dxf.start.x), float(entity.dxf.start.y)), round(z0, 3)))
+                out.append(((float(entity.dxf.end.x), float(entity.dxf.end.y)), round(z1, 3)))
+    except Exception:
+        return []
+    return out
+
+
 def walk_entities(entities, doc, transform=None, depth=0):
     if depth > 8:
         return
@@ -563,11 +637,7 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
             if lyr.upper() == target_clean:
                 pts = entity_to_wcs_points(entity, xform)
                 if pts and len(pts) >= 2:
-                    elev = 0.0
-                    try:
-                        elev = float(entity.dxf.get("elevation", 0.0))
-                    except Exception:
-                        pass
+                    elev = _extract_entity_authentic_elevation(entity)
                     layer_raw.setdefault(lyr, []).append({
                         "points": pts,
                         "elevation": elev,
@@ -585,11 +655,7 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
             all_layers.add(lyr)
             pts = entity_to_wcs_points(entity, xform)
             if pts and len(pts) >= 2:
-                elev = 0.0
-                try:
-                    elev = float(entity.dxf.get("elevation", 0.0))
-                except Exception:
-                    pass
+                elev = _extract_entity_authentic_elevation(entity)
                 layer_raw.setdefault(lyr, []).append({
                     "points": pts,
                     "elevation": elev,
@@ -662,13 +728,17 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
         if len(projected) < 2:
             continue
 
+        elev_val = item["elevation"]
+        if elev_val is not None:
+            projected = [[p[0], p[1], elev_val] for p in projected]
+
         seg_name = f"SEG-{seg_counter:02d}"
         feat = {
             "type": "Feature",
             "properties": {
                 "layer": chosen_layer,
                 "segment": seg_name,
-                "elevation": item["elevation"]
+                "elevation": elev_val
             },
             "geometry": {
                 "type": "LineString",
@@ -676,7 +746,7 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
             },
             "layer": chosen_layer,
             "segment": seg_name,
-            "elevation": item["elevation"],
+            "elevation": elev_val,
             "coordinates": projected
         }
         features_out.append(feat)
@@ -841,11 +911,8 @@ def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
             feat_type, prefix = "CorridorLine", "SEG"
 
         seg_counts[prefix] = seg_counts.get(prefix, 0) + 1
-        elev = 0.0
-        try:
-            elev = float(entity.dxf.get("elevation", 0.0))
-        except Exception:
-            pass
+        elev = _extract_entity_authentic_elevation(entity)
+        coords_out = [[p[0], p[1], elev] for p in projected] if elev is not None else projected
 
         features.append({
             "type": "Feature",
@@ -857,7 +924,7 @@ def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
             },
             "geometry": {
                 "type": "LineString",
-                "coordinates": projected
+                "coordinates": coords_out
             }
         })
 
@@ -903,7 +970,7 @@ def _build_crs_metadata(cm: float, k0: float, axis_order: str) -> dict:
 
 def parse_road(
     dxf_path_str: str,
-    road_width: float = 7.0,
+    road_width: float = None,
     target_layer: str = None,
     central_meridian: float = None,
     swap_xy: bool = False,
@@ -941,7 +1008,9 @@ def parse_road(
     if eff_axis == "VN2000_XY":
         swap_xy = True
 
-    half_w = max(0.5, road_width / 2.0)
+    has_valid_width = (road_width is not None and float(road_width) > 0)
+    eff_road_width = float(road_width) if has_valid_width else None
+    half_w = (eff_road_width / 2.0) if has_valid_width else 0.0
 
     def _normalize_cad_pt(p):
         if eff_axis == "CAD_EN" and not swap_xy:
@@ -965,6 +1034,7 @@ def parse_road(
     open_primary_lines = []
     closed_primary_lines = []
     open_entity_polylines = []
+    vertex_z_map = {}
 
     def _collect_entity_segments(ent, raw_pts):
         if not raw_pts or len(raw_pts) < 2:
@@ -981,6 +1051,9 @@ def parse_road(
                 filtered_chain.append(fixed_pts[i+1])
         if not is_closed_ent and len(filtered_chain) >= 2:
             open_entity_polylines.append(filtered_chain)
+            for raw_xy, z_val in _extract_entity_vertex_z_pairs(ent):
+                norm_xy = _normalize_cad_pt(raw_xy)
+                vertex_z_map[(round(norm_xy[0], 2), round(norm_xy[1], 2))] = z_val
 
     for e in msp:
         if e.dxf.layer.upper() == chosen_layer.upper():
@@ -1055,16 +1128,20 @@ def parse_road(
         full_net = unary_union(full_cluster)
         sample_x, sample_y = list(primary_lines[0].coords)[0]
         is_degree_dxf = abs(sample_x) <= 180.0 and abs(sample_y) <= 90.0
-        buf_dist = (half_w / 111320.0) if is_degree_dxf else half_w
-        buffered_poly = full_net.buffer(buf_dist, cap_style='flat', join_style='round')
-        if buffered_poly.geom_type == 'MultiPolygon':
-            poly_main = max(buffered_poly.geoms, key=lambda p: p.area)
-        else:
-            poly_main = buffered_poly
-
-        poly_coords = list(poly_main.exterior.coords)
         tot_len = full_net.length * (111320.0 if is_degree_dxf else 1.0)
-        surface_area_sqm = round(float(poly_main.area * ((111320.0 ** 2) if is_degree_dxf else 1.0)), 2)
+        if has_valid_width:
+            buf_dist = (half_w / 111320.0) if is_degree_dxf else half_w
+            buffered_poly = full_net.buffer(buf_dist, cap_style='flat', join_style='round')
+            if buffered_poly.geom_type == 'MultiPolygon':
+                poly_main = max(buffered_poly.geoms, key=lambda p: p.area)
+            else:
+                poly_main = buffered_poly
+
+            poly_coords = list(poly_main.exterior.coords)
+            surface_area_sqm = round(float(poly_main.area * ((111320.0 ** 2) if is_degree_dxf else 1.0)), 2)
+        else:
+            poly_coords = []
+            surface_area_sqm = None
 
         close_tol = (0.05 / 111320.0) if is_degree_dxf else 0.05
         parallel_tol = (12.0 / 111320.0) if is_degree_dxf else 12.0
@@ -1336,10 +1413,10 @@ def parse_road(
                         except Exception:
                             pass
     else:
-        poly_coords = list(primary_lines[0].coords)
-        main_chain = poly_coords
+        poly_coords = []
+        main_chain = list(primary_lines[0].coords)
         tot_len = 0.0
-        surface_area_sqm = 0.0
+        surface_area_sqm = None
         raw_branches = [main_chain]
         traffic_islands_geom = []
 
@@ -1347,20 +1424,33 @@ def parse_road(
     coord_state, is_swapped_detected = _classify_coordinate_system(main_chain)
     effective_cm = central_meridian if (central_meridian and central_meridian > 0) else detect_central_meridian(test_pt[0], test_pt[1])
 
+    def _attach_vertex_z(pts_2d, projected_latlon):
+        out = []
+        for p_cad, p_gps in zip(pts_2d, projected_latlon):
+            z_val = vertex_z_map.get((round(float(p_cad[0]), 2), round(float(p_cad[1]), 2)))
+            if z_val is not None:
+                out.append([p_gps[0], p_gps[1], round(float(z_val), 3)])
+            else:
+                out.append([p_gps[0], p_gps[1]])
+        return out
+
     if coord_state == "GEOREFERENCED_VN2000" and HAS_PYPROJ:
         tf_custom = make_vn2000_transformer(effective_cm, eff_k0)
         def proj_pts(pts):
+            if not pts:
+                return []
             lons, lats = tf_custom.transform([p[0] for p in pts], [p[1] for p in pts])
             return [[round(float(la), 8), round(float(lo), 8)] for lo, la in zip(lons, lats)]
 
-        cl_gps = proj_pts(main_chain)
-        poly_gps = proj_pts(poly_coords)
+        cl_gps = _attach_vertex_z(main_chain, proj_pts(main_chain))
+        poly_gps = proj_pts(poly_coords) if poly_coords else []
         branches_gps = [proj_pts(b) for b in raw_branches]
         islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
-        all_surface_polygons = [poly_gps] + islands_gps
+        all_surface_polygons = ([poly_gps] if poly_gps else []) + islands_gps
 
-        all_lats = [p[0] for p in poly_gps]
-        all_lons = [p[1] for p in poly_gps]
+        bound_source = poly_gps if poly_gps else (cl_gps + [pt for br in branches_gps for pt in br])
+        all_lats = [p[0] for p in bound_source]
+        all_lons = [p[1] for p in bound_source]
         bounds = [
             [round(min(all_lats), 8), round(min(all_lons), 8)],
             [round(max(all_lats), 8), round(max(all_lons), 8)]
@@ -1377,19 +1467,22 @@ def parse_road(
 
     elif coord_state == "GEOREFERENCED_WGS84":
         def proj_pts(pts):
+            if not pts:
+                return []
             if is_swapped_detected:
                 return [[round(float(p[0]), 8), round(float(p[1]), 8)] for p in pts]
             else:
                 return [[round(float(p[1]), 8), round(float(p[0]), 8)] for p in pts]
 
-        cl_gps = proj_pts(main_chain)
-        poly_gps = proj_pts(poly_coords)
+        cl_gps = _attach_vertex_z(main_chain, proj_pts(main_chain))
+        poly_gps = proj_pts(poly_coords) if poly_coords else []
         branches_gps = [proj_pts(b) for b in raw_branches]
         islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
-        all_surface_polygons = [poly_gps] + islands_gps
+        all_surface_polygons = ([poly_gps] if poly_gps else []) + islands_gps
 
-        all_lats = [p[0] for p in poly_gps]
-        all_lons = [p[1] for p in poly_gps]
+        bound_source = poly_gps if poly_gps else (cl_gps + [pt for br in branches_gps for pt in br])
+        all_lats = [p[0] for p in bound_source]
+        all_lons = [p[1] for p in bound_source]
         bounds = [
             [round(min(all_lats), 8), round(min(all_lons), 8)],
             [round(max(all_lats), 8), round(max(all_lons), 8)]
@@ -1437,18 +1530,18 @@ def parse_road(
         elif "VIA" in u or "LE" in u: cat = "Sidewalk"
         layer_stats.append({"name": l, "count": cnt, "category": cat})
 
-    nominal_area_sqm = round(tot_len * road_width, 2)
-    if surface_area_sqm <= 0:
-        surface_area_sqm = nominal_area_sqm
+    nominal_area_sqm = round(tot_len * eff_road_width, 2) if has_valid_width else None
+    has_authentic_z = any(len(pt) >= 3 for pt in cl_gps)
 
     mid = len(poly_gps) // 2 if poly_gps else 0
     return {
         "success": True,
         "roadName": "Tuyến đường hoàn chỉnh (Đầy đủ nhánh & nút giao)",
-        "roadWidth": road_width,
+        "roadWidth": eff_road_width,
         "totalLengthMeters": round(tot_len, 2),
         "surfaceAreaSqm": surface_area_sqm,
         "nominalAreaSqm": nominal_area_sqm,
+        "hasAuthentic3DElevation": has_authentic_z,
         "centralMeridian": effective_cm,
         "scaleFactor": eff_k0,
         "axisOrder": eff_axis,
@@ -1468,7 +1561,12 @@ def parse_road(
         "notice": notice,
         "candidateLayers": candidate_layers,
         "centerlineLayerName": chosen_layer,
-        "centerlineCad": [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in main_chain],
+        "centerlineCad": [
+            [round(float(p[0]), 4), round(float(p[1]), 4), vertex_z_map[(round(float(p[0]), 2), round(float(p[1]), 2))]]
+            if (round(float(p[0]), 2), round(float(p[1]), 2)) in vertex_z_map
+            else [round(float(p[0]), 4), round(float(p[1]), 4)]
+            for p in main_chain
+        ],
         "centerlineBranchesCad": [[[round(float(p[0]), 4), round(float(p[1]), 4)] for p in b] for b in raw_branches],
         "roadSurfacePolygonCad": [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in poly_coords]
     }
@@ -1476,7 +1574,7 @@ def parse_road(
 
 def parse_coords(
     payload_path: str,
-    road_width: float = 7.0,
+    road_width: float = None,
     central_meridian: float = None,
     scale_factor: float = None,
     axis_order: str = None
@@ -1514,6 +1612,7 @@ def parse_coords(
     )
 
     pts = []          # normalized (easting, northing) in metres
+    pts_z = []        # optional explicit Z per point (float or None)
     bad_lines = []
     ambiguous_lines = []
     detected_orders = set()
@@ -1534,11 +1633,16 @@ def parse_coords(
             continue
 
         # If a line has 3+ numbers and the first number is a small integer index (1, 2, 3... < 10000),
-        # take the coordinate pair from nums[1], nums[2]
+        # take the coordinate pair from nums[1], nums[2], and optional Z from nums[3]
+        z_val = None
         if len(nums) >= 3 and abs(float(nums[0])) < 10000.0 and abs(float(nums[1])) >= 100000.0 and abs(float(nums[2])) >= 100000.0:
             a, b = float(nums[1]), float(nums[2])
+            if len(nums) >= 4:
+                z_val = round(float(nums[3]), 3)
         else:
             a, b = float(nums[0]), float(nums[1])
+            if len(nums) >= 3:
+                z_val = round(float(nums[2]), 3)
 
         if eff_axis == "VN2000_XY":
             n, e = a, b
@@ -1572,6 +1676,7 @@ def parse_coords(
         if pts and math.hypot(e - pts[-1][0], n - pts[-1][1]) < 0.01:
             continue
         pts.append((e, n))
+        pts_z.append(z_val)
 
     if ambiguous_lines or len(detected_orders) > 1:
         line_info = f" tại dòng {', '.join(map(str, ambiguous_lines[:10]))}" if ambiguous_lines else " do thứ tự cột không đồng nhất giữa các dòng"
@@ -1597,65 +1702,82 @@ def parse_coords(
 
     resolved_axis = eff_axis if eff_axis != "AUTO" else (next(iter(detected_orders)) if detected_orders else "VN2000_XY")
 
-    # Ribbon with miter correction at each vertex
-    half_w = max(0.5, road_width / 2.0)
+    has_valid_width = (road_width is not None and float(road_width) > 0)
+    eff_road_width = float(road_width) if has_valid_width else None
     n_pts = len(pts)
-    seg_norm = []
-    for i in range(n_pts - 1):
-        dx, dy = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]
-        l = math.hypot(dx, dy)
-        seg_norm.append((-dy / l, dx / l))
-    left, right = [], []
-    for i in range(n_pts):
-        if i == 0:
-            nx, ny, scale = seg_norm[0][0], seg_norm[0][1], 1.0
-        elif i == n_pts - 1:
-            nx, ny, scale = seg_norm[-1][0], seg_norm[-1][1], 1.0
-        else:
-            sx = seg_norm[i - 1][0] + seg_norm[i][0]
-            sy = seg_norm[i - 1][1] + seg_norm[i][1]
-            sl = math.hypot(sx, sy)
-            if sl < 1e-6:
-                nx, ny, scale = seg_norm[i][0], seg_norm[i][1], 1.0
-            else:
-                nx, ny = sx / sl, sy / sl
-                cos_half = nx * seg_norm[i][0] + ny * seg_norm[i][1]
-                scale = min(2.0, 1.0 / max(cos_half, 0.5))
-        left.append((pts[i][0] + nx * half_w * scale, pts[i][1] + ny * half_w * scale))
-        right.append((pts[i][0] - nx * half_w * scale, pts[i][1] - ny * half_w * scale))
-    poly = left + right[::-1]
-    poly.append(poly[0])
-
     total_len = sum(math.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]) for i in range(n_pts - 1))
-    surface_area_sqm = round(_shoelace_area(poly), 2)
-    nominal_area_sqm = round(total_len * road_width, 2)
+
+    if has_valid_width:
+        # Ribbon with miter correction at each vertex
+        half_w = eff_road_width / 2.0
+        seg_norm = []
+        for i in range(n_pts - 1):
+            dx, dy = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]
+            l = math.hypot(dx, dy)
+            seg_norm.append((-dy / l, dx / l))
+        left, right = [], []
+        for i in range(n_pts):
+            if i == 0:
+                nx, ny, scale = seg_norm[0][0], seg_norm[0][1], 1.0
+            elif i == n_pts - 1:
+                nx, ny, scale = seg_norm[-1][0], seg_norm[-1][1], 1.0
+            else:
+                sx = seg_norm[i - 1][0] + seg_norm[i][0]
+                sy = seg_norm[i - 1][1] + seg_norm[i][1]
+                sl = math.hypot(sx, sy)
+                if sl < 1e-6:
+                    nx, ny, scale = seg_norm[i][0], seg_norm[i][1], 1.0
+                else:
+                    nx, ny = sx / sl, sy / sl
+                    cos_half = nx * seg_norm[i][0] + ny * seg_norm[i][1]
+                    scale = min(2.0, 1.0 / max(cos_half, 0.5))
+            left.append((pts[i][0] + nx * half_w * scale, pts[i][1] + ny * half_w * scale))
+            right.append((pts[i][0] - nx * half_w * scale, pts[i][1] - ny * half_w * scale))
+        poly = left + right[::-1]
+        poly.append(poly[0])
+        surface_area_sqm = round(_shoelace_area(poly), 2)
+        nominal_area_sqm = round(total_len * eff_road_width, 2)
+    else:
+        left, right, poly = [], [], []
+        surface_area_sqm = None
+        nominal_area_sqm = None
 
     cm = eff_cm_arg if eff_cm_arg else detect_central_meridian(pts[0][0], pts[0][1])
     if HAS_PYPROJ:
         tf = make_vn2000_transformer(cm, eff_k0)
         def proj_pts(arr):
+            if not arr:
+                return []
             lons, lats = tf.transform([p[0] for p in arr], [p[1] for p in arr])
             return [[round(float(la), 8), round(float(lo), 8)] for lo, la in zip(lons, lats)]
     else:
         def proj_pts(arr):
+            if not arr:
+                return []
             return [[round(float(v[1]), 8), round(float(v[0]), 8)] for v in (_manual_utm(p[0], p[1]) for p in arr)]
 
-    cl_gps = proj_pts(pts)
-    poly_gps = proj_pts(poly)
-    left_gps = proj_pts(left)
-    right_gps = proj_pts(right)
-    lats = [p[0] for p in poly_gps]
-    lons = [p[1] for p in poly_gps]
+    cl_gps_2d = proj_pts(pts)
+    cl_gps = [
+        [p_gps[0], p_gps[1], z_val] if z_val is not None else [p_gps[0], p_gps[1]]
+        for p_gps, z_val in zip(cl_gps_2d, pts_z)
+    ]
+    poly_gps = proj_pts(poly) if poly else []
+    left_gps = proj_pts(left) if left else []
+    right_gps = proj_pts(right) if right else []
+    bound_source = poly_gps if poly_gps else cl_gps
+    lats = [p[0] for p in bound_source]
+    lons = [p[1] for p in bound_source]
     bounds = [[round(min(lats), 8), round(min(lons), 8)], [round(max(lats), 8), round(max(lons), 8)]]
     bbox = [round(min(lons), 8), round(min(lats), 8), round(max(lons), 8), round(max(lats), 8)]
 
     return {
         "success": True,
         "roadName": "Tuyến nhập tọa độ VN-2000",
-        "roadWidth": road_width,
+        "roadWidth": eff_road_width,
         "totalLengthMeters": round(total_len, 2),
         "surfaceAreaSqm": surface_area_sqm,
         "nominalAreaSqm": nominal_area_sqm,
+        "hasAuthentic3DElevation": any(z is not None for z in pts_z),
         "centralMeridian": cm,
         "scaleFactor": eff_k0,
         "axisOrder": resolved_axis,
@@ -1668,7 +1790,7 @@ def parse_coords(
         "centerline": cl_gps,
         "centerlineBranches": [],
         "roadSurfacePolygon": poly_gps,
-        "roadSurfacePolygons": [poly_gps],
+        "roadSurfacePolygons": [poly_gps] if poly_gps else [],
         "trafficIslands": [],
         "layerStats": [],
         "leftEdge": left_gps,
@@ -2081,7 +2203,7 @@ def main():
 
     rpp = sub.add_parser("parse-road")
     rpp.add_argument("dxf_path")
-    rpp.add_argument("--width", type=float, default=7.0, help="Road width in meters")
+    rpp.add_argument("--width", type=float, default=0.0, help="Road width in meters (0 or omitted if not declared)")
     rpp.add_argument("--layer", default=None, help="Force centerline layer")
     rpp.add_argument("--cm", type=float, default=None, help="Custom Central Meridian (e.g. 105.75, 105.5, 105.0)")
     rpp.add_argument("--k0", type=float, default=0.9999, help="Scale factor (0.9999 for 3deg, 0.9996 for 6deg)")
@@ -2090,7 +2212,7 @@ def main():
 
     cpp = sub.add_parser("parse-coords")
     cpp.add_argument("dxf_path", help="Path to JSON payload file with the typed coordinates")
-    cpp.add_argument("--width", type=float, default=7.0)
+    cpp.add_argument("--width", type=float, default=0.0)
     cpp.add_argument("--cm", type=float, default=None)
     cpp.add_argument("--k0", type=float, default=None)
     cpp.add_argument("--axis-order", default=None)
@@ -2131,7 +2253,7 @@ def main():
         elif args.command == "parse-road":
             print(json.dumps(parse_road(
                 args.dxf_path,
-                road_width=getattr(args, "width", 7.0),
+                road_width=getattr(args, "width", 0.0),
                 target_layer=getattr(args, "layer", None),
                 central_meridian=getattr(args, "cm", None),
                 swap_xy=getattr(args, "swap_xy", False),
@@ -2141,7 +2263,7 @@ def main():
         elif args.command == "parse-coords":
             print(json.dumps(parse_coords(
                 args.dxf_path,
-                road_width=getattr(args, "width", 7.0),
+                road_width=getattr(args, "width", 0.0),
                 central_meridian=getattr(args, "cm", None),
                 scale_factor=getattr(args, "k0", None),
                 axis_order=getattr(args, "axis_order", None)

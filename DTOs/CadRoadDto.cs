@@ -8,7 +8,7 @@ namespace RoadGuard.CadParser.DTOs
     public sealed class CadParseRoadRequest
     {
         public IFormFile File { get; set; } = null!;
-        public double RoadWidth { get; set; } = 7.0;
+        public double RoadWidth { get; set; } = 0.0;
         public string? CenterlineLayerName { get; set; }
         public double? CentralMeridian { get; set; }
         public double? ScaleFactor { get; set; }
@@ -19,7 +19,7 @@ namespace RoadGuard.CadParser.DTOs
     {
         /// <summary>One VN-2000 point per line, e.g. "1199145.22, 614235.15" (Northing, Easting; order configurable or auto-detected).</summary>
         public string Coordinates { get; set; } = string.Empty;
-        public double RoadWidth { get; set; } = 7.0;
+        public double RoadWidth { get; set; } = 0.0;
         public double? CentralMeridian { get; set; }
         public double? ScaleFactor { get; set; }
         public string? AxisOrder { get; set; }
@@ -37,7 +37,11 @@ namespace RoadGuard.CadParser.DTOs
 
         [JsonProperty("roadWidth")]
         [JsonPropertyName("roadWidth")]
-        public double RoadWidth { get; set; } = 7.0;
+        public double? RoadWidth { get; set; }
+
+        [JsonProperty("hasAuthentic3DElevation")]
+        [JsonPropertyName("hasAuthentic3DElevation")]
+        public bool? HasAuthentic3DElevation { get; set; }
 
         [JsonProperty("totalLengthMeters")]
         [JsonPropertyName("totalLengthMeters")]
