@@ -873,9 +873,9 @@ def compute_layer_bbox(doc, layer_name):
         if entity.dxftype() in LINEAR_TYPES and entity.dxf.get("layer", "0").upper() == layer_name.upper():
             wcs_pts = entity_to_wcs_points(entity, xform)
             pts.extend(wcs_pts)
-    valid_pts = [(x, y) for x, y in pts if _is_vn2000(x, y)]
+    valid_pts = [(p[0], p[1]) for p in pts if _is_vn2000(p[0], p[1])]
     if not valid_pts:
-        valid_pts = pts
+        valid_pts = [(p[0], p[1]) for p in pts]
     if not valid_pts:
         return None
     xs = [p[0] for p in valid_pts]
@@ -888,13 +888,13 @@ def compute_wcs_bbox(doc):
     for entity, xform in walk_entities(doc.modelspace(), doc):
         if entity.dxftype() in LINEAR_TYPES:
             wcs_pts = entity_to_wcs_points(entity, xform)
-            for x, y in wcs_pts:
-                if _is_vn2000(x, y):
-                    pts.append((x, y))
+            for p in wcs_pts:
+                if _is_vn2000(p[0], p[1]):
+                    pts.append((p[0], p[1]))
     if not pts:
         for entity, xform in walk_entities(doc.modelspace(), doc):
             if entity.dxftype() in LINEAR_TYPES:
-                pts.extend(entity_to_wcs_points(entity, xform))
+                pts.extend([(p[0], p[1]) for p in entity_to_wcs_points(entity, xform)])
     if not pts:
         return 0.0, 0.0, 1000.0, 1000.0
     xs = [p[0] for p in pts]
@@ -972,7 +972,14 @@ def extract_corridor_geojson(msp, doc, chosen_layer, corridor_bbox, srid=4326):
 
         seg_counts[prefix] = seg_counts.get(prefix, 0) + 1
         elev = _extract_entity_authentic_elevation(entity)
-        coords_out = [[p[0], p[1], elev] for p in projected] if elev is not None else projected
+        coords_out = []
+        for p in projected:
+            if len(p) >= 3 and p[2] is not None:
+                coords_out.append([round(float(p[0]), 8), round(float(p[1]), 8), round(float(p[2]), 3)])
+            elif elev is not None:
+                coords_out.append([round(float(p[0]), 8), round(float(p[1]), 8), round(float(elev), 3)])
+            else:
+                coords_out.append([round(float(p[0]), 8), round(float(p[1]), 8)])
 
         features.append({
             "type": "Feature",
