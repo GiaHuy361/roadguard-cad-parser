@@ -240,9 +240,14 @@ def project_wgs84_to_utm(points_lonlat: list, target_srid: int = 32648) -> list:
 def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = None, scale_factor: float = 0.9999) -> list:
     if not points_xy:
         return []
-    x0, y0 = points_xy[0]
+    x0, y0 = points_xy[0][0], points_xy[0][1]
     if abs(x0) <= 180.0 and abs(y0) <= 90.0 and target_srid == 4326:
-        return [[round(float(x), 8), round(float(y), 8)] for x, y in points_xy]
+        return [
+            [round(float(p[0]), 8), round(float(p[1]), 8), round(float(p[2]), 3)]
+            if len(p) >= 3 and p[2] is not None
+            else [round(float(p[0]), 8), round(float(p[1]), 8)]
+            for p in points_xy
+        ]
     if not HAS_PYPROJ:
         raise RuntimeError("Missing required geodetic library: pyproj is required for accurate VN-2000 geodetic projection.")
 
@@ -263,7 +268,13 @@ def project_points(points_xy: list, target_srid: int = 4326, custom_cm: float = 
         tf = Transformer.from_crs(crs_in, crs_out, always_xy=True)
 
     lons, lats = tf.transform([p[0] for p in points_xy], [p[1] for p in points_xy])
-    return [[round(float(lon), 8), round(float(lat), 8)] for lon, lat in zip(lons, lats)]
+    out = []
+    for pt, lon, lat in zip(points_xy, lons, lats):
+        if len(pt) >= 3 and pt[2] is not None:
+            out.append([round(float(lon), 8), round(float(lat), 8), round(float(pt[2]), 3)])
+        else:
+            out.append([round(float(lon), 8), round(float(lat), 8)])
+    return out
 
 
 def project_to_wgs84(points_xy: list, custom_cm: float = None, scale_factor: float = 0.9999) -> list:
@@ -370,24 +381,35 @@ def entity_to_wcs_points(entity, transform=None):
     pts = []
     try:
         if t == "LINE":
-            pts = [(entity.dxf.start.x, entity.dxf.start.y),
-                   (entity.dxf.end.x, entity.dxf.end.y)]
+            z0 = float(entity.dxf.start.z)
+            z1 = float(entity.dxf.end.z)
+            if abs(z0) > 1e-6 or abs(z1) > 1e-6:
+                pts = [(entity.dxf.start.x, entity.dxf.start.y, z0),
+                       (entity.dxf.end.x, entity.dxf.end.y, z1)]
+            else:
+                pts = [(entity.dxf.start.x, entity.dxf.start.y),
+                       (entity.dxf.end.x, entity.dxf.end.y)]
         elif t == "LWPOLYLINE":
+            has_elev = entity.dxf.hasattr("elevation")
+            elev_val = round(float(entity.dxf.elevation), 3) if has_elev else None
             raw = list(entity.get_points("xyb"))
             if not raw:
                 raw = [(x, y, 0.0) for x, y in entity.get_points("xy")]
             if len(raw) < 2:
-                pts = [(p[0], p[1]) for p in raw]
+                pts = [(p[0], p[1], elev_val) if has_elev else (p[0], p[1]) for p in raw]
             else:
                 for i in range(len(raw) - 1):
                     x0s, y0s, bl = raw[i][0], raw[i][1], raw[i][2]
                     x1s, y1s = raw[i + 1][0], raw[i + 1][1]
+                    p0 = (x0s, y0s, elev_val) if has_elev else (x0s, y0s)
                     if abs(bl) < 1e-9:
-                        pts.append((x0s, y0s))
+                        pts.append(p0)
                     else:
                         ap = _tessellate_bulge(x0s, y0s, x1s, y1s, bl)
-                        pts.extend(ap[:-1])
-                pts.append((raw[-1][0], raw[-1][1]))
+                        for ax, ay in ap[:-1]:
+                            pts.append((ax, ay, elev_val) if has_elev else (ax, ay))
+                p_last = (raw[-1][0], raw[-1][1], elev_val) if has_elev else (raw[-1][0], raw[-1][1])
+                pts.append(p_last)
 
                 if entity.is_closed:
                     last_bl = raw[-1][2]
@@ -395,45 +417,71 @@ def entity_to_wcs_points(entity, transform=None):
                     x1s, y1s = raw[0][0], raw[0][1]
                     if abs(last_bl) > 1e-9:
                         ap = _tessellate_bulge(x0s, y0s, x1s, y1s, last_bl)
-                        pts.extend(ap[1:])
+                        for ax, ay in ap[1:]:
+                            pts.append((ax, ay, elev_val) if has_elev else (ax, ay))
                     else:
                         if pts and (pts[0][0] != pts[-1][0] or pts[0][1] != pts[-1][1]):
                             pts.append(pts[0])
         elif t == "POLYLINE":
+            flags = int(entity.dxf.get("flags", 0)) if entity.dxf.hasattr("flags") else 0
+            is_3d = bool(flags & 8) or getattr(entity, "is_3d_polyline", False)
+            verts = list(entity.vertices)
+            zs = [float(v.dxf.location.z) for v in verts if v.dxf.hasattr("location")]
+            has_authentic_z = is_3d or any(abs(z) > 1e-6 for z in zs)
             raw = []
-            for v in entity.vertices:
+            for v in verts:
                 loc = v.dxf.location
                 b = v.dxf.get("bulge", 0.0) if v.dxf.hasattr("bulge") else 0.0
-                raw.append((loc.x, loc.y, b))
+                z_coord = float(loc.z) if has_authentic_z else None
+                raw.append((loc.x, loc.y, z_coord, b))
+
             if len(raw) < 2:
-                pts = [(p[0], p[1]) for p in raw]
+                pts = [(p[0], p[1], p[2]) if p[2] is not None else (p[0], p[1]) for p in raw]
             else:
                 for i in range(len(raw) - 1):
-                    x0s, y0s, bl = raw[i][0], raw[i][1], raw[i][2]
-                    x1s, y1s = raw[i + 1][0], raw[i + 1][1]
+                    x0s, y0s, z0s, bl = raw[i][0], raw[i][1], raw[i][2], raw[i][3]
+                    x1s, y1s, z1s, _  = raw[i + 1][0], raw[i + 1][1], raw[i + 1][2], raw[i + 1][3]
+                    p0 = (x0s, y0s, z0s) if z0s is not None else (x0s, y0s)
                     if abs(bl) < 1e-9:
-                        pts.append((x0s, y0s))
+                        pts.append(p0)
                     else:
                         ap = _tessellate_bulge(x0s, y0s, x1s, y1s, bl)
-                        pts.extend(ap[:-1])
-                pts.append((raw[-1][0], raw[-1][1]))
+                        n_ap = len(ap)
+                        for idx_ap, (ax, ay) in enumerate(ap[:-1]):
+                            if z0s is not None and z1s is not None:
+                                az = z0s + (z1s - z0s) * (idx_ap / max(1, n_ap - 1))
+                                pts.append((ax, ay, az))
+                            else:
+                                pts.append((ax, ay))
+                p_last = (raw[-1][0], raw[-1][1], raw[-1][2]) if raw[-1][2] is not None else (raw[-1][0], raw[-1][1])
+                pts.append(p_last)
 
                 if entity.is_closed:
-                    last_bl = raw[-1][2]
-                    x0s, y0s = raw[-1][0], raw[-1][1]
-                    x1s, y1s = raw[0][0], raw[0][1]
+                    last_bl = raw[-1][3]
+                    x0s, y0s, z0s = raw[-1][0], raw[-1][1], raw[-1][2]
+                    x1s, y1s, z1s = raw[0][0], raw[0][1], raw[0][2]
                     if abs(last_bl) > 1e-9:
                         ap = _tessellate_bulge(x0s, y0s, x1s, y1s, last_bl)
-                        pts.extend(ap[1:])
+                        n_ap = len(ap)
+                        for idx_ap, (ax, ay) in enumerate(ap[1:]):
+                            if z0s is not None and z1s is not None:
+                                az = z0s + (z1s - z0s) * ((idx_ap + 1) / max(1, n_ap))
+                                pts.append((ax, ay, az))
+                            else:
+                                pts.append((ax, ay))
                     else:
                         if pts and (pts[0][0] != pts[-1][0] or pts[0][1] != pts[-1][1]):
                             pts.append(pts[0])
         elif t == "ARC":
-            pts = _tessellate_arc(entity.dxf.center.x, entity.dxf.center.y,
-                                  entity.dxf.radius, entity.dxf.start_angle, entity.dxf.end_angle)
+            zc = float(entity.dxf.center.z)
+            pts_2d = _tessellate_arc(entity.dxf.center.x, entity.dxf.center.y,
+                                     entity.dxf.radius, entity.dxf.start_angle, entity.dxf.end_angle)
+            pts = [(ax, ay, zc) if abs(zc) > 1e-6 else (ax, ay) for ax, ay in pts_2d]
         elif t == "CIRCLE":
-            pts = _tessellate_arc(entity.dxf.center.x, entity.dxf.center.y,
-                                  entity.dxf.radius, 0.0, 360.0)
+            zc = float(entity.dxf.center.z)
+            pts_2d = _tessellate_arc(entity.dxf.center.x, entity.dxf.center.y,
+                                     entity.dxf.radius, 0.0, 360.0)
+            pts = [(ax, ay, zc) if abs(zc) > 1e-6 else (ax, ay) for ax, ay in pts_2d]
         elif t == "SPLINE":
             p = dxf_path.make_path(entity)
             v = list(p.flattening(distance=0.5))
@@ -445,8 +493,15 @@ def entity_to_wcs_points(entity, transform=None):
         return []
 
     if transform is not None:
-        return [(transform.transform((x, y, 0))[0], transform.transform((x, y, 0))[1])
-                for x, y in pts]
+        res = []
+        for p in pts:
+            if len(p) >= 3 and p[2] is not None:
+                tx, ty, tz = transform.transform((p[0], p[1], p[2]))
+                res.append((tx, ty, tz))
+            else:
+                tx, ty, _ = transform.transform((p[0], p[1], 0.0))
+                res.append((tx, ty))
+        return res
     return pts
 
 
@@ -463,7 +518,7 @@ def _extract_entity_authentic_elevation(entity):
             return None
         elif t == "POLYLINE":
             flags = int(entity.dxf.get("flags", 0)) if entity.dxf.hasattr("flags") else 0
-            is_3d_poly = bool(flags & 8)
+            is_3d_poly = bool(flags & 8) or getattr(entity, "is_3d_polyline", False)
             zs = [float(v.dxf.location.z) for v in entity.vertices if v.dxf.hasattr("location")]
             if is_3d_poly or any(abs(z) > 1e-6 for z in zs):
                 return round(sum(zs) / len(zs), 3) if zs else 0.0
@@ -506,7 +561,7 @@ def _extract_entity_vertex_z_pairs(entity):
                     out.append(((float(x), float(y)), z_val))
         elif t == "POLYLINE":
             flags = int(entity.dxf.get("flags", 0)) if entity.dxf.hasattr("flags") else 0
-            is_3d_poly = bool(flags & 8)
+            is_3d_poly = bool(flags & 8) or getattr(entity, "is_3d_polyline", False)
             verts = list(entity.vertices)
             zs = [float(v.dxf.location.z) for v in verts if v.dxf.hasattr("location")]
             if is_3d_poly or any(abs(z) > 1e-6 for z in zs):
@@ -709,11 +764,14 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
     swap_xy = (eff_axis == "VN2000_XY")
 
     def _normalize_extract_pt(p):
+        z = p[2] if len(p) >= 3 else None
         if eff_axis == "CAD_EN" and not swap_xy:
-            return (p[0], p[1])
-        if (p[0] > 950_000.0 and p[1] < 900_000.0) or swap_xy:
-            return (p[1], p[0])
-        return (p[0], p[1])
+            norm_xy = (p[0], p[1])
+        elif (p[0] > 950_000.0 and p[1] < 900_000.0) or swap_xy:
+            norm_xy = (p[1], p[0])
+        else:
+            norm_xy = (p[0], p[1])
+        return (norm_xy[0], norm_xy[1], z) if z is not None else norm_xy
 
     features_out = []
     seg_counter = 1
@@ -730,7 +788,9 @@ def extract_geometries(dxf_path_str, target_layer=None, srid=4326, central_merid
 
         elev_val = item["elevation"]
         if elev_val is not None:
-            projected = [[p[0], p[1], elev_val] for p in projected]
+            for i, p in enumerate(projected):
+                if len(p) < 3:
+                    projected[i] = [p[0], p[1], elev_val]
 
         seg_name = f"SEG-{seg_counter:02d}"
         feat = {
@@ -1013,11 +1073,14 @@ def parse_road(
     half_w = (eff_road_width / 2.0) if has_valid_width else 0.0
 
     def _normalize_cad_pt(p):
+        z = p[2] if len(p) >= 3 else None
         if eff_axis == "CAD_EN" and not swap_xy:
-            return (p[0], p[1])
-        if (p[0] > 950_000.0 and p[1] < 900_000.0) or swap_xy:
-            return (p[1], p[0])
-        return (p[0], p[1])
+            norm_xy = (p[0], p[1])
+        elif (p[0] > 950_000.0 and p[1] < 900_000.0) or swap_xy:
+            norm_xy = (p[1], p[0])
+        else:
+            norm_xy = (p[0], p[1])
+        return (norm_xy[0], norm_xy[1], z) if z is not None else norm_xy
 
     # 1. Collect linear entities directly from modelspace with bulge & arc tessellation
     # Exclude closed ring entities (callout table frames, traffic islands, manholes) when open alignment entities exist.
@@ -1126,7 +1189,7 @@ def parse_road(
             branch_candidates = still_cands
 
         full_net = unary_union(full_cluster)
-        sample_x, sample_y = list(primary_lines[0].coords)[0]
+        sample_x, sample_y = list(primary_lines[0].coords)[0][:2]
         is_degree_dxf = abs(sample_x) <= 180.0 and abs(sample_y) <= 90.0
         tot_len = full_net.length * (111320.0 if is_degree_dxf else 1.0)
         if has_valid_width:
@@ -1444,7 +1507,7 @@ def parse_road(
 
         cl_gps = _attach_vertex_z(main_chain, proj_pts(main_chain))
         poly_gps = proj_pts(poly_coords) if poly_coords else []
-        branches_gps = [proj_pts(b) for b in raw_branches]
+        branches_gps = [_attach_vertex_z(b, proj_pts(b)) for b in raw_branches]
         islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
         all_surface_polygons = ([poly_gps] if poly_gps else []) + islands_gps
 
@@ -1476,7 +1539,7 @@ def parse_road(
 
         cl_gps = _attach_vertex_z(main_chain, proj_pts(main_chain))
         poly_gps = proj_pts(poly_coords) if poly_coords else []
-        branches_gps = [proj_pts(b) for b in raw_branches]
+        branches_gps = [_attach_vertex_z(b, proj_pts(b)) for b in raw_branches]
         islands_gps = [proj_pts(list(isl.exterior.coords)) for isl in traffic_islands_geom]
         all_surface_polygons = ([poly_gps] if poly_gps else []) + islands_gps
 
@@ -1567,7 +1630,15 @@ def parse_road(
             else [round(float(p[0]), 4), round(float(p[1]), 4)]
             for p in main_chain
         ],
-        "centerlineBranchesCad": [[[round(float(p[0]), 4), round(float(p[1]), 4)] for p in b] for b in raw_branches],
+        "centerlineBranchesCad": [
+            [
+                [round(float(p[0]), 4), round(float(p[1]), 4), vertex_z_map[(round(float(p[0]), 2), round(float(p[1]), 2))]]
+                if (round(float(p[0]), 2), round(float(p[1]), 2)) in vertex_z_map
+                else [round(float(p[0]), 4), round(float(p[1]), 4)]
+                for p in b
+            ]
+            for b in raw_branches
+        ],
         "roadSurfacePolygonCad": [[round(float(p[0]), 4), round(float(p[1]), 4)] for p in poly_coords]
     }
 
@@ -2120,10 +2191,16 @@ def build_and_validate_roadguard_draft(payload_path: str) -> dict:
         return {"success": False, "error": "InvalidChangeReason", "detail": "changeReason là bắt buộc."}
 
     station_origin = float(payload.get("stationOriginMeters", 0.0))
-    road_width = float(payload.get("roadWidth", 7.0))
-    survey_width = float(payload.get("surveyWidthMeters", max(road_width, 7.0)))
-    if road_width <= 0 or survey_width <= 0 or road_width > survey_width:
-        return {"success": False, "error": "InvalidWidth", "detail": "roadWidth và surveyWidthMeters phải > 0 và widthMeters <= surveyWidthMeters."}
+    road_width_raw = payload.get("roadWidth")
+    survey_width_raw = payload.get("surveyWidthMeters")
+    if road_width_raw is None or float(road_width_raw) <= 0:
+        return {"success": False, "error": "InvalidRoadWidth", "detail": "roadWidth là bắt buộc và phải > 0m."}
+    if survey_width_raw is None or float(survey_width_raw) <= 0:
+        return {"success": False, "error": "InvalidSurveyWidth", "detail": "surveyWidthMeters là bắt buộc và phải > 0m."}
+    road_width = float(road_width_raw)
+    survey_width = float(survey_width_raw)
+    if road_width > survey_width:
+        return {"success": False, "error": "InvalidWidth", "detail": "widthMeters không được vượt quá surveyWidthMeters."}
 
     wgs84_coords = payload.get("centerlineWgs84", [])
     if not isinstance(wgs84_coords, list) or len(wgs84_coords) < 2:
